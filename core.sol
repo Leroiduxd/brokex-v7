@@ -100,8 +100,10 @@ contract BrokexCore {
     }
 
     /* ===================== */
-    /*  ASSET MANAGEMENT     */
+    /*  ASSET LISTING        */
     /* ===================== */
+
+    uint256 public listedAssetsCount;
 
     function listAsset(
         uint32 assetId,
@@ -132,7 +134,14 @@ contract BrokexCore {
             maxPhysicalMove: maxPhysicalMove,
             listed: true
         });
+
+        listedAssetsCount += 1;
     }
+
+    function isAssetListed(uint32 assetId) external view returns (bool) {
+        return assets[assetId].listed;
+    }
+
 
     function updateLotSize(
         uint32 assetId,
