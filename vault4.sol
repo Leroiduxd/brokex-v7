@@ -40,21 +40,20 @@ interface IBrokexCoreRead {
         returns (uint32 longLots, uint32 shortLots, uint256 avgLongPrice, uint256 avgShortPrice);
 }
 
-/* =========================================================
-   BrokexVault
-   - Traders: deposit/withdraw USDC directly in Vault
-   - LPs: epoch deposits + keeper distribution of shares
-   - LPs: epoch withdrawal requests (by shares) + rollover finalization (burn shares)
-         + keeper funds epochs FIFO + users claim by withdrawalId
-   - PnL run: oracle snapshot <=120s, proof <=60s
-   - Trades: core-only bookkeeping, Vault moves internal balances, Core never holds money
-   - No events.
-   ========================================================= */
+/*
+    BrokexVault (no events)
+    - Traders: deposit/withdraw USDC in vault (Core never holds funds)
+    - LP deposits: ONE pending deposit per wallet per epoch (merge)
+    - LP withdrawals: ONE withdrawal request per wallet per epoch (merge)
+    - Epoch rollover 24h
+    - PnL run snapshot <=120s, proof age <=60s
+*/
 contract BrokexVault {
     /* ============
        Constants
        ============ */
     uint256 public constant EPOCH_DURATION = 24 hours;
+
     uint256 public constant RUN_MAX_DURATION = 120; // seconds
     uint256 public constant PROOF_MAX_AGE = 60;     // seconds
 
@@ -63,6 +62,10 @@ contract BrokexVault {
 
     uint256 public constant OWNER_COMMISSION_BPS = 3_000; // 30%
     uint256 public constant OWNER_LOSS_BPS = 500;         // 5%
+
+    // IMPORTANT: assumes USDC has 6 decimals -> 100 USDC = 100e6.
+    // If your USDC uses 18 decimals, change to 100e18.
+    uint256 public constant MIN_DEPOSIT_USDC = 100e6;
 
     /* ============
        Deps / roles
@@ -85,7 +88,7 @@ contract BrokexVault {
     }
 
     /* ============
-       Trader funds (Core never holds money)
+       Trader funds
        ============ */
     mapping(address => uint256) public traderBalanceUSDC;
 
@@ -113,17 +116,18 @@ contract BrokexVault {
     uint256 public totalShares;
 
     /* ============
-       Capital buckets (USDC token units)
+       Capital buckets (USDC)
        ============ */
-    uint256 public lpCapitalUSDC;        // realized LP capital (vault assets owned by LPs)
-    uint256 public lpLockedUSDC;         // sum of LPLOC locked for open positions
-    uint256 public ownerBalanceUSDC;     // owner fees (30% commissions + 5% trader losses)
+    uint256 public lpCapitalUSDC;        // LP NAV (realized)
+    uint256 public lpLockedUSDC;         // LPLOC locked for open positions
+    uint256 public ownerBalanceUSDC;     // owner fees
 
-    uint256 public traderMarginHeldUSDC; // sum of trader margins held (orders + positions)
+    uint256 public traderMarginHeldUSDC; // margins held for open orders/positions
     uint256 public commissionHeldUSDC;   // commissions held for pending orders (state=0)
 
     /* ============
-       LP Deposits (subscription)
+       LP Deposits
+       - ONE pending deposit per wallet per epoch (merge)
        ============ */
     struct Deposit {
         address lp;
@@ -135,209 +139,64 @@ contract BrokexVault {
     uint256 public nextDepositId;          // starts at 1
     uint256 public nextDepositIdToProcess; // starts at 1
     uint256 public pendingDepositsUSDC;    // sum pending deposits for current epoch
+
     mapping(uint256 => Deposit) public deposits;
     mapping(uint32 => uint256) public epochMaxDepositId; // epoch => max depositId
 
-    /* ============
-       LP Withdrawals (redemptions)
-       - request in shares during epoch N
-       - at rollEpoch (end of N): burn shares, fix USD value using lpPriceEnd[N]
-       - keeper funds epochs FIFO as liquidity becomes free
-       - user claims by withdrawalId only when its epoch is fully funded
-       ============ */
+    // one pending deposit slot per wallet per epoch:
+    mapping(address => uint32) public pendingDepositEpochOf;
+    mapping(address => uint256) public pendingDepositIdOf;
 
+    /* ============
+       LP Withdrawals
+       - ONE request per wallet per epoch (merge)
+       ============ */
     struct Withdrawal {
         address lp;
         uint32 epochRequested;
-        uint256 shares;   // shares locked at request, burned at rollover
+        uint256 shares;   // locked at request, burned at rollover
         bool cancelled;
         bool claimed;
     }
 
-    uint256 public nextWithdrawalId;     // starts at 1
-    uint256 public pendingWithdrawShares; // shares requested in current epoch (to be finalized at rollover)
+    uint256 public nextWithdrawalId;      // starts at 1
+    uint256 public pendingWithdrawShares; // sum shares requested in current epoch
 
-    // Per epoch: how much USDC is required to pay withdrawals of that epoch (fixed at rollover)
+    mapping(uint256 => Withdrawal) public withdrawals;
+
+    // one withdrawal request slot per wallet per epoch:
+    mapping(address => uint32) public pendingWithdrawalEpochOf;
+    mapping(address => uint256) public pendingWithdrawalIdOf;
+
+    // Per epoch: fixed USD required (set at rollover)
     mapping(uint32 => uint256) public withdrawEpochRequiredUSDC;
-    // Per epoch: how much USDC has been funded/allocated by keeper for that epoch
+    // Per epoch: funded USD (keeper allocates FIFO)
     mapping(uint32 => uint256) public withdrawEpochFundedUSDC;
 
     // FIFO pointer: earliest epoch not fully funded
     uint32 public nextWithdrawEpochToFund;
 
     // Global tracking:
-    // - outstanding: required but not yet funded (still blocked for trading)
-    // - escrow: funded and reserved for withdrawals but not yet claimed (still blocked for trading)
+    // outstanding: required but not funded (blocked from trading)
+    // escrow: funded but not claimed (also blocked)
     uint256 public withdrawOutstandingUSDC;
     uint256 public withdrawEscrowUSDC;
 
-    mapping(uint256 => Withdrawal) public withdrawals;
-
-    function requestWithdrawal(uint256 sharesAmount) external returns (uint256 withdrawalId) {
-        require(sharesAmount > 0, "SHARES_0");
-
-        uint256 balShares = sharesOf[msg.sender];
-        require(balShares >= sharesAmount, "SHARES_LOW");
-
-        // Lock shares immediately (remove from usable balance)
-        sharesOf[msg.sender] = balShares - sharesAmount;
-
-        withdrawalId = nextWithdrawalId++;
-        withdrawals[withdrawalId] = Withdrawal({
-            lp: msg.sender,
-            epochRequested: currentEpoch,
-            shares: sharesAmount,
-            cancelled: false,
-            claimed: false
-        });
-
-        pendingWithdrawShares += sharesAmount;
-    }
-
-    function cancelWithdrawal(uint256 withdrawalId) external {
-        Withdrawal storage w = withdrawals[withdrawalId];
-        require(w.lp == msg.sender, "NOT_OWNER");
-        require(!w.cancelled, "CANCELLED");
-        require(!w.claimed, "CLAIMED");
-
-        // Only cancellable BEFORE rollover of its epoch
-        // (meaning: the epochRequested is still the current epoch)
-        require(w.epochRequested == currentEpoch, "EPOCH_ALREADY_FINAL");
-
-        uint256 s = w.shares;
-        require(s > 0, "ZERO_SHARES");
-
-        w.cancelled = true;
-
-        // Unlock shares back to LP
-        sharesOf[msg.sender] += s;
-
-        // Reduce pending counter
-        require(pendingWithdrawShares >= s, "PENDING_UNDERFLOW");
-        pendingWithdrawShares -= s;
-
-        // We keep struct data for history; no rewriting amounts.
-    }
-
-    /// @notice Keeper allocates available liquidity to withdrawal epochs FIFO.
-    /// @dev No arguments by design (as you requested). Hard cap loops to avoid gas bombs.
-    function fundNextWithdrawalEpochs() external {
-        // Hard caps
-        uint256 maxEpochs = 10;
-
-        // No need to fund if nothing outstanding
-        if (withdrawOutstandingUSDC == 0) return;
-
-        uint32 e = nextWithdrawEpochToFund;
-        uint256 processed = 0;
-
-        while (processed < maxEpochs) {
-            uint256 req = withdrawEpochRequiredUSDC[e];
-            uint256 funded = withdrawEpochFundedUSDC[e];
-
-            // Skip epochs with no withdrawals or already fully funded
-            if (req == 0 || funded >= req) {
-                // move pointer forward
-                e += 1;
-                processed += 1;
-
-                // stop if we passed currentEpoch (no future epochs can be funded yet)
-                if (e > currentEpoch) break;
-                continue;
-            }
-
-            // Free liquidity that can be earmarked now:
-            // lpCapital - lpLocked - already escrowed
-            uint256 free;
-            if (lpCapitalUSDC <= lpLockedUSDC + withdrawEscrowUSDC) {
-                free = 0;
-            } else {
-                free = lpCapitalUSDC - lpLockedUSDC - withdrawEscrowUSDC;
-            }
-
-            if (free == 0) break;
-
-            uint256 need = req - funded;
-
-            // cannot allocate more than outstanding (sanity), nor more than free liquidity
-            uint256 amt = need;
-            if (amt > free) amt = free;
-            if (amt > withdrawOutstandingUSDC) amt = withdrawOutstandingUSDC;
-
-            if (amt == 0) break;
-
-            withdrawEpochFundedUSDC[e] = funded + amt;
-
-            // Move global buckets: outstanding -> escrow
-            withdrawOutstandingUSDC -= amt;
-            withdrawEscrowUSDC += amt;
-
-            // If epoch now fully funded, advance pointer; else stop (still same epoch)
-            if (withdrawEpochFundedUSDC[e] >= req) {
-                e += 1;
-                processed += 1;
-                if (e > currentEpoch) break;
-                continue;
-            } else {
-                break;
-            }
-        }
-
-        nextWithdrawEpochToFund = e;
-    }
-
-    function claimWithdrawal(uint256 withdrawalId) external {
-        Withdrawal storage w = withdrawals[withdrawalId];
-        require(w.lp == msg.sender, "NOT_OWNER");
-        require(!w.cancelled, "CANCELLED");
-        require(!w.claimed, "ALREADY_CLAIMED");
-
-        uint32 e = w.epochRequested;
-
-        // Must be finalized (epoch ended)
-        require(epochs[e].endTimestamp != 0, "EPOCH_NOT_FINAL");
-
-        // Epoch must be fully funded before any claim (your rule: "epoch aboutie")
-        uint256 req = withdrawEpochRequiredUSDC[e];
-        require(req > 0, "NO_WITHDRAW_EPOCH");
-        require(withdrawEpochFundedUSDC[e] >= req, "EPOCH_NOT_FUNDED");
-
-        // Amount in USDC = shares * priceEnd(epoch)
-        uint256 price = epochs[e].lpPriceEnd;
-        require(price > 0, "PRICE_0");
-
-        uint256 amountUSDC = (w.shares * price) / ONE;
-        require(amountUSDC > 0, "AMOUNT_0");
-
-        // Pay from escrow
-        require(withdrawEscrowUSDC >= amountUSDC, "ESCROW_LOW");
-        withdrawEscrowUSDC -= amountUSDC;
-
-        // Assets actually leave LP capital now
-        require(lpCapitalUSDC >= amountUSDC, "LP_CAP_LOW");
-        lpCapitalUSDC -= amountUSDC;
-
-        w.claimed = true;
-
-        bool ok = usdc.transfer(w.lp, amountUSDC);
-        require(ok, "TRANSFER_FAIL");
-    }
-
     /* ============
-       Epochs history
+       Epoch history
        ============ */
     struct EpochData {
         uint64 startTimestamp;
         uint64 endTimestamp;
+
         uint256 totalSharesAtStart;
         uint256 lpPriceEnd;            // 1e18
         uint256 lpCapitalAtEndUSDC;
-        int256  unrealizedPnlAtEndX6;  // signed, 1e6 units (trader PnL)
+        int256  unrealizedPnlAtEndX6;  // signed 1e6
 
         uint256 depositsIntegratedUSDC;
         uint256 mintedShares;
 
-        // Withdrawals finalized at end of this epoch:
         uint256 withdrawSharesFinalized;
         uint256 withdrawRequiredUSDC;
     }
@@ -370,7 +229,7 @@ contract BrokexVault {
         address trader;
         uint256 marginUSDC;
         uint256 commissionUSDC;
-        uint256 lpLockUSDC; // LPLOC = max profit payable
+        uint256 lpLockUSDC; // max profit payable
         uint8   state;
         bool    exists;
     }
@@ -422,52 +281,65 @@ contract BrokexVault {
     }
 
     /* =========================================================
-       LP Deposits (pending subscription)
+       LP Deposits (ONE per wallet per epoch, merge)
+       - If wallet already has a pending deposit in currentEpoch: increase it
+       - Else: create a new depositId (requires >= MIN_DEPOSIT_USDC)
        ========================================================= */
 
-    function deposit(uint256 amountUSDC) external {
+    function deposit(uint256 amountUSDC) external returns (uint256 depositId) {
         require(amountUSDC > 0, "AMOUNT_0");
+
+        uint32 e = currentEpoch;
+
+        // Merge if already has a pending deposit for this epoch
+        if (pendingDepositEpochOf[msg.sender] == e) {
+            depositId = pendingDepositIdOf[msg.sender];
+            Deposit storage d = deposits[depositId];
+            // sanity
+            require(d.lp == msg.sender, "BAD_DEPOSIT_OWNER");
+            require(!d.processed, "PROCESSED");
+            require(d.epochDeposited == e, "BAD_EPOCH");
+
+            bool ok1 = usdc.transferFrom(msg.sender, address(this), amountUSDC);
+            require(ok1, "TRANSFERFROM_FAIL");
+
+            d.amountUSDC += amountUSDC;
+            pendingDepositsUSDC += amountUSDC;
+            return depositId;
+        }
+
+        // New deposit slot for this epoch
+        require(amountUSDC >= MIN_DEPOSIT_USDC, "MIN_DEPOSIT");
+
         bool ok = usdc.transferFrom(msg.sender, address(this), amountUSDC);
         require(ok, "TRANSFERFROM_FAIL");
 
-        uint256 id = nextDepositId++;
-        deposits[id] = Deposit({
+        depositId = nextDepositId++;
+        deposits[depositId] = Deposit({
             lp: msg.sender,
-            epochDeposited: currentEpoch,
+            epochDeposited: e,
             amountUSDC: amountUSDC,
             processed: false
         });
 
+        pendingDepositEpochOf[msg.sender] = e;
+        pendingDepositIdOf[msg.sender] = depositId;
+
         pendingDepositsUSDC += amountUSDC;
 
-        if (id > epochMaxDepositId[currentEpoch]) {
-            epochMaxDepositId[currentEpoch] = id;
+        if (depositId > epochMaxDepositId[e]) {
+            epochMaxDepositId[e] = depositId;
         }
-    }
-
-    function _requirePendingEditable(uint256 depositId) internal view returns (Deposit storage d) {
-        d = deposits[depositId];
-        require(d.lp == msg.sender, "NOT_OWNER");
-        require(!d.processed, "PROCESSED");
-        require(d.epochDeposited == currentEpoch, "EPOCH_CLOSED");
-        require(d.amountUSDC > 0, "EMPTY");
-    }
-
-    function addToDeposit(uint256 depositId, uint256 addAmountUSDC) external {
-        require(addAmountUSDC > 0, "AMOUNT_0");
-        Deposit storage d = _requirePendingEditable(depositId);
-
-        bool ok = usdc.transferFrom(msg.sender, address(this), addAmountUSDC);
-        require(ok, "TRANSFERFROM_FAIL");
-
-        d.amountUSDC += addAmountUSDC;
-        pendingDepositsUSDC += addAmountUSDC;
     }
 
     function withdrawFromDeposit(uint256 depositId, uint256 withdrawAmountUSDC) external {
         require(withdrawAmountUSDC > 0, "AMOUNT_0");
-        Deposit storage d = _requirePendingEditable(depositId);
-        require(withdrawAmountUSDC <= d.amountUSDC, "EXCEEDS");
+
+        Deposit storage d = deposits[depositId];
+        require(d.lp == msg.sender, "NOT_OWNER");
+        require(!d.processed, "PROCESSED");
+        require(d.epochDeposited == currentEpoch, "EPOCH_CLOSED");
+        require(d.amountUSDC >= withdrawAmountUSDC, "EXCEEDS");
 
         d.amountUSDC -= withdrawAmountUSDC;
         pendingDepositsUSDC -= withdrawAmountUSDC;
@@ -511,8 +383,166 @@ contract BrokexVault {
     }
 
     /* =========================================================
+       LP Withdrawals (ONE per wallet per epoch, merge)
+       - requestWithdrawal(shares) merges into the same withdrawalId for current epoch
+       ========================================================= */
+
+    function requestWithdrawal(uint256 sharesAmount) external returns (uint256 withdrawalId) {
+        require(sharesAmount > 0, "SHARES_0");
+        uint32 e = currentEpoch;
+
+        // Must have enough shares to lock
+        uint256 balShares = sharesOf[msg.sender];
+        require(balShares >= sharesAmount, "SHARES_LOW");
+        sharesOf[msg.sender] = balShares - sharesAmount;
+
+        // Merge if already has a pending withdrawal request in this epoch
+        if (pendingWithdrawalEpochOf[msg.sender] == e) {
+            withdrawalId = pendingWithdrawalIdOf[msg.sender];
+            Withdrawal storage w = withdrawals[withdrawalId];
+
+            require(w.lp == msg.sender, "BAD_W_OWNER");
+            require(w.epochRequested == e, "BAD_W_EPOCH");
+            require(!w.cancelled, "CANCELLED");
+            require(!w.claimed, "CLAIMED");
+
+            w.shares += sharesAmount;
+            pendingWithdrawShares += sharesAmount;
+            return withdrawalId;
+        }
+
+        // New withdrawal request slot for this epoch
+        withdrawalId = nextWithdrawalId++;
+        withdrawals[withdrawalId] = Withdrawal({
+            lp: msg.sender,
+            epochRequested: e,
+            shares: sharesAmount,
+            cancelled: false,
+            claimed: false
+        });
+
+        pendingWithdrawalEpochOf[msg.sender] = e;
+        pendingWithdrawalIdOf[msg.sender] = withdrawalId;
+
+        pendingWithdrawShares += sharesAmount;
+    }
+
+    function cancelWithdrawal(uint256 withdrawalId) external {
+        Withdrawal storage w = withdrawals[withdrawalId];
+        require(w.lp == msg.sender, "NOT_OWNER");
+        require(!w.cancelled, "CANCELLED");
+        require(!w.claimed, "CLAIMED");
+
+        // Only cancellable BEFORE rollover of its epoch
+        require(w.epochRequested == currentEpoch, "EPOCH_ALREADY_FINAL");
+
+        uint256 s = w.shares;
+        require(s > 0, "ZERO_SHARES");
+
+        w.cancelled = true;
+
+        // Unlock all shares back
+        sharesOf[msg.sender] += s;
+
+        // Decrease pending counter
+        require(pendingWithdrawShares >= s, "PENDING_UNDERFLOW");
+        pendingWithdrawShares -= s;
+
+        // Free the per-epoch slot so user can create a new request in the same epoch (optional but practical)
+        if (pendingWithdrawalEpochOf[msg.sender] == currentEpoch && pendingWithdrawalIdOf[msg.sender] == withdrawalId) {
+            pendingWithdrawalEpochOf[msg.sender] = 0;
+            pendingWithdrawalIdOf[msg.sender] = 0;
+        }
+    }
+
+    /// @notice Keeper allocates available liquidity to withdrawal epochs FIFO.
+    /// @dev No arguments by design. Hard cap loops to avoid gas bombs.
+    function fundNextWithdrawalEpochs() external {
+        if (withdrawOutstandingUSDC == 0) return;
+
+        uint256 maxEpochs = 10;
+        uint32 e = nextWithdrawEpochToFund;
+        uint256 processed = 0;
+
+        while (processed < maxEpochs) {
+            uint256 req = withdrawEpochRequiredUSDC[e];
+            uint256 funded = withdrawEpochFundedUSDC[e];
+
+            if (req == 0 || funded >= req) {
+                e += 1;
+                processed += 1;
+                if (e > currentEpoch) break;
+                continue;
+            }
+
+            uint256 free;
+            if (lpCapitalUSDC <= lpLockedUSDC + withdrawEscrowUSDC) {
+                free = 0;
+            } else {
+                free = lpCapitalUSDC - lpLockedUSDC - withdrawEscrowUSDC;
+            }
+
+            if (free == 0) break;
+
+            uint256 need = req - funded;
+            uint256 amt = need;
+            if (amt > free) amt = free;
+            if (amt > withdrawOutstandingUSDC) amt = withdrawOutstandingUSDC;
+
+            if (amt == 0) break;
+
+            withdrawEpochFundedUSDC[e] = funded + amt;
+
+            withdrawOutstandingUSDC -= amt;
+            withdrawEscrowUSDC += amt;
+
+            if (withdrawEpochFundedUSDC[e] >= req) {
+                e += 1;
+                processed += 1;
+                if (e > currentEpoch) break;
+                continue;
+            } else {
+                break;
+            }
+        }
+
+        nextWithdrawEpochToFund = e;
+    }
+
+    function claimWithdrawal(uint256 withdrawalId) external {
+        Withdrawal storage w = withdrawals[withdrawalId];
+        require(w.lp == msg.sender, "NOT_OWNER");
+        require(!w.cancelled, "CANCELLED");
+        require(!w.claimed, "ALREADY_CLAIMED");
+
+        uint32 e = w.epochRequested;
+
+        require(epochs[e].endTimestamp != 0, "EPOCH_NOT_FINAL");
+
+        uint256 req = withdrawEpochRequiredUSDC[e];
+        require(req > 0, "NO_WITHDRAW_EPOCH");
+        require(withdrawEpochFundedUSDC[e] >= req, "EPOCH_NOT_FUNDED");
+
+        uint256 price = epochs[e].lpPriceEnd;
+        require(price > 0, "PRICE_0");
+
+        uint256 amountUSDC = (w.shares * price) / ONE;
+        require(amountUSDC > 0, "AMOUNT_0");
+
+        require(withdrawEscrowUSDC >= amountUSDC, "ESCROW_LOW");
+        withdrawEscrowUSDC -= amountUSDC;
+
+        require(lpCapitalUSDC >= amountUSDC, "LP_CAP_LOW");
+        lpCapitalUSDC -= amountUSDC;
+
+        w.claimed = true;
+
+        bool ok = usdc.transfer(w.lp, amountUSDC);
+        require(ok, "TRANSFER_FAIL");
+    }
+
+    /* =========================================================
        Trades (core-only)
-       Core never moves funds. Vault debits/credits traderBalanceUSDC.
        ========================================================= */
 
     function openOrder(
@@ -687,10 +717,6 @@ contract BrokexVault {
     function _lockLp(uint256 amountUSDC) internal {
         require(amountUSDC > 0, "LOCK_0");
 
-        // Trading-available LP capital excludes:
-        // - already locked for other positions
-        // - outstanding withdrawals (not yet funded)
-        // - escrowed withdrawals (funded but not yet claimed)
         uint256 blocked = lpLockedUSDC + withdrawOutstandingUSDC + withdrawEscrowUSDC;
 
         require(lpCapitalUSDC >= blocked, "BLOCKED_GT_CAP");
@@ -707,7 +733,7 @@ contract BrokexVault {
     }
 
     /* =========================================================
-       Unrealized PnL run (snapshot <=120s, proof <=60s)
+       Unrealized PnL run
        ========================================================= */
 
     function runUnrealizedPnl(bytes calldata supraProof) external {
@@ -767,10 +793,7 @@ contract BrokexVault {
     }
 
     /* =========================================================
-       Epoch rollover / LP price
-       NAV uses realized LP capital ONLY (lpCapitalUSDC),
-       but excludes reserved withdrawals (outstanding + escrow),
-       and excludes ownerBalance, trader balances, margins held, commissions held, pending deposits.
+       Epoch rollover (Fair withdrawals rule respected)
        ========================================================= */
 
     function rollEpoch() external {
@@ -779,31 +802,22 @@ contract BrokexVault {
         uint256 startTs = uint256(epochs[e].startTimestamp);
         require(block.timestamp >= startTs + EPOCH_DURATION, "EPOCH_NOT_24H");
 
-        // Must have a finalized PnL run for this epoch
         uint256 finalRunId = epochFinalRunId[e];
         require(finalRunId != 0 && finalRunId == pnlRunId && pnlRunEpoch == e, "NO_FINAL_RUN");
         int256 unrealX6 = epochFinalUnrealizedX6[e];
 
-        // Ensure all deposits for this epoch have been processed into user shares BEFORE price finalization
-        // (your rule: don't move to next epoch if deposit attribution not finished)
         require(allDepositsProcessedForEpoch(e), "DEPOSITS_NOT_PROCESSED");
 
-        // ------------------------------------------------------------
-        // 1) Compute lpPriceEnd[e] WITHOUT counting current epoch pending withdrawals.
-        //    Only subtract withdrawals already finalized in past epochs:
-        //    withdrawOutstandingUSDC + withdrawEscrowUSDC.
-        // ------------------------------------------------------------
+        // 1) Compute priceEnd WITHOUT counting pendingWithdrawShares of epoch e.
+        //    Only subtract withdrawals already finalized in previous epochs:
         uint256 reservedPrev = withdrawOutstandingUSDC + withdrawEscrowUSDC;
 
         uint256 priceEnd;
         if (totalShares == 0) {
-            priceEnd = ONE; // bootstrap
+            priceEnd = ONE;
         } else {
-            // NAV = (lpCapital - reservedPrev) - unrealizedPnL
-            // Important: pendingWithdrawShares (epoch e requests) is NOT removed here.
             int256 navSigned = int256(lpCapitalUSDC) - int256(reservedPrev) - unrealX6;
             require(navSigned > 0, "NAV_LE_0");
-
             priceEnd = (uint256(navSigned) * ONE) / totalShares;
             require(priceEnd > 0, "PRICE_0");
         }
@@ -814,41 +828,29 @@ contract BrokexVault {
         epochs[e].lpCapitalAtEndUSDC = lpCapitalUSDC;
         epochs[e].unrealizedPnlAtEndX6 = unrealX6;
 
-        // ------------------------------------------------------------
-        // 2) Finalize withdrawals requested DURING epoch e (pendingWithdrawShares)
-        //    AFTER priceEnd is fixed:
-        //      - burn shares from totalShares (shares already removed from user balance at request time)
-        //      - compute requiredUSDC using priceEnd[e]
-        //      - add requiredUSDC to withdrawOutstandingUSDC (effective from epoch e+1 onward)
-        // ------------------------------------------------------------
+        // 2) Finalize withdrawals requested during epoch e (burn shares, convert to USD debt)
         uint256 withdrawShares = pendingWithdrawShares;
         if (withdrawShares > 0) {
             require(totalShares >= withdrawShares, "TOTAL_SHARES_LOW");
-            totalShares -= withdrawShares; // burn
+            totalShares -= withdrawShares;
 
             uint256 requiredUSDC = (withdrawShares * priceEnd) / ONE;
             require(requiredUSDC > 0, "WITHDRAW_REQ_0");
 
             pendingWithdrawShares = 0;
 
-            // record epoch needs
             withdrawEpochRequiredUSDC[e] += requiredUSDC;
             withdrawOutstandingUSDC += requiredUSDC;
 
             epochs[e].withdrawSharesFinalized = withdrawShares;
             epochs[e].withdrawRequiredUSDC = requiredUSDC;
 
-            // ensure FIFO funding pointer starts at the first relevant epoch
             if (nextWithdrawEpochToFund > e) {
                 nextWithdrawEpochToFund = e;
             }
         }
 
-        // ------------------------------------------------------------
-        // 3) Integrate pending deposits made DURING epoch e into LP capital,
-        //    and mint global shares at priceEnd[e].
-        //    (User share attribution remains handled later via processNextDeposits().)
-        // ------------------------------------------------------------
+        // 3) Integrate pending deposits of epoch e into LP capital and mint global shares
         uint256 depositSum = pendingDepositsUSDC;
         epochs[e].depositsIntegratedUSDC = depositSum;
 
@@ -863,22 +865,19 @@ contract BrokexVault {
             pendingDepositsUSDC = 0;
         }
 
-        // ------------------------------------------------------------
-        // 4) Open next epoch (e+1)
-        // ------------------------------------------------------------
+        // 4) Open next epoch
         uint32 nextE = e + 1;
         currentEpoch = nextE;
 
         epochs[nextE].startTimestamp = uint64(block.timestamp);
         epochs[nextE].totalSharesAtStart = totalShares;
 
-        // Reset run accumulators for next epoch
+        // Reset run accumulators
         pnlRunEpoch = nextE;
         pnlRunStartTimestamp = 0;
         pnlProcessedCount = 0;
         pnlUnrealizedSumX6 = 0;
     }
-
 
     /* =========================================================
        Views / helpers
@@ -890,12 +889,6 @@ contract BrokexVault {
         return lpCapitalUSDC - blocked;
     }
 
-    function availableLiquidityForFundingWithdrawalsUSDC() external view returns (uint256) {
-        // how much can the keeper allocate right now (not counting outstanding as already reserved)
-        if (lpCapitalUSDC <= lpLockedUSDC + withdrawEscrowUSDC) return 0;
-        return lpCapitalUSDC - lpLockedUSDC - withdrawEscrowUSDC;
-    }
-
     function secondsUntilEpochMature() external view returns (uint256) {
         uint256 startTs = uint256(epochs[currentEpoch].startTimestamp);
         if (block.timestamp >= startTs + EPOCH_DURATION) return 0;
@@ -903,7 +896,7 @@ contract BrokexVault {
     }
 
     /* =========================================================
-       Unrealized PnL calc (PLACEHOLDER - adapt to your units)
+       Unrealized PnL calc (PLACEHOLDER — adapt to your real units)
        ========================================================= */
     function _calcAssetUnrealizedPnlX6(
         uint32 longLots,
