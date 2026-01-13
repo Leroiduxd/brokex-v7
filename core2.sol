@@ -18,9 +18,9 @@ interface ISupraOraclePull {
         uint256[] round;
     }
 
-    function verifyOracleProofV2(bytes calldata _bytesproof)
-        external
-        returns (PriceInfo memory);
+    function verifyOracleProofV2(
+        bytes calldata _bytesproof
+    ) external returns (PriceInfo memory);
 }
 
 /* ===================== */
@@ -74,18 +74,16 @@ contract BrokexCore {
         uint32 assetId;
         bool isLong;
         uint8 leverage;
-
         // For orders (state=0): openPrice=0, openTimestamp=0, fundingIndex=0
         // For market positions (state=1): openPrice set (with spread), fundingIndex snapshot set
-        uint48 openPrice;      // 1e6
-        uint8  state;
-        uint32 openTimestamp;  // unix
-        uint64 fundingIndex;   // snapshot at open (only for state=1)
-
-        uint48 closePrice;     // 1e6 (unused here, kept for your future close logic)
-        int32  lotSize;        // lots
-        uint48 stopLoss;       // 1e6 (0 ignore)
-        uint48 takeProfit;     // 1e6 (0 ignore)
+        uint48 openPrice; // 1e6
+        uint8 state;
+        uint32 openTimestamp; // unix
+        uint64 fundingIndex; // snapshot at open (only for state=1)
+        uint48 closePrice; // 1e6 (unused here, kept for your future close logic)
+        int32 lotSize; // lots
+        uint48 stopLoss; // 1e6 (0 ignore)
+        uint48 takeProfit; // 1e6 (0 ignore)
     }
 
     struct Exposure {
@@ -104,12 +102,12 @@ contract BrokexCore {
         uint32 numerator;
         uint32 denominator;
         uint32 baseFundingRate;
-        uint32 spread;          // 1e6 "price delta per lot" logic (your design)
-        uint32 commission;      // in BPS
+        uint32 spread; // 1e6 "price delta per lot" logic (your design)
+        uint32 commission; // in BPS
         uint32 weekendFunding;
         uint16 securityMultiplier;
         uint16 maxPhysicalMove;
-        uint8  maxLeverage;     // round leverages only
+        uint8 maxLeverage; // round leverages only
         bool listed;
     }
 
@@ -162,20 +160,20 @@ contract BrokexCore {
     }
 
     function _isRoundLeverage(uint8 lev) internal pure returns (bool) {
-        return (
-            lev == 1  ||
-            lev == 2  ||
-            lev == 3  ||
-            lev == 5  ||
+        return (lev == 1 ||
+            lev == 2 ||
+            lev == 3 ||
+            lev == 5 ||
             lev == 10 ||
             lev == 20 ||
             lev == 25 ||
             lev == 50 ||
-            lev == 100
-        );
+            lev == 100);
     }
 
-    function _requireAssetListed(uint32 assetId) internal view returns (Asset memory a) {
+    function _requireAssetListed(
+        uint32 assetId
+    ) internal view returns (Asset memory a) {
         a = assets[assetId];
         require(a.listed, "ASSET_NOT_LISTED");
     }
@@ -187,44 +185,55 @@ contract BrokexCore {
     }
 
     // commission is in BPS, applied on notional in USDC6
-    function calculateCommission(uint32 assetId, uint256 notionalUSDC6) public view returns (uint256) {
+    function calculateCommission(
+        uint32 assetId,
+        uint256 notionalUSDC6
+    ) public view returns (uint256) {
         uint256 bps = uint256(assets[assetId].commission);
         if (bps == 0) return 0;
         return (notionalUSDC6 * bps) / BPS;
     }
 
     // lots -> qty units using numerator/denominator
-    function _lotQtyUnits(Asset memory a, uint32 lots) internal pure returns (uint256) {
+    function _lotQtyUnits(
+        Asset memory a,
+        uint32 lots
+    ) internal pure returns (uint256) {
         // listing guarantees numerator>=1 && denominator>=1
         return (uint256(lots) * uint256(a.numerator)) / uint256(a.denominator);
     }
 
     function _validateSLTP(
         bool isLong,
-        uint256 refPrice6,  // target (limit) or entry (market), in 1e6
-        uint48 stopLoss,    // 1e6 (0 ignore)
-        uint48 takeProfit   // 1e6 (0 ignore)
+        uint256 refPrice6, // target (limit) or entry (market), in 1e6
+        uint48 stopLoss, // 1e6 (0 ignore)
+        uint48 takeProfit // 1e6 (0 ignore)
     ) internal pure {
         if (stopLoss != 0) {
             if (isLong) require(uint256(stopLoss) < refPrice6, "BAD_SL");
-            else        require(uint256(stopLoss) > refPrice6, "BAD_SL");
+            else require(uint256(stopLoss) > refPrice6, "BAD_SL");
         }
         if (takeProfit != 0) {
             if (isLong) require(uint256(takeProfit) > refPrice6, "BAD_TP");
-            else        require(uint256(takeProfit) < refPrice6, "BAD_TP");
+            else require(uint256(takeProfit) < refPrice6, "BAD_TP");
         }
     }
 
     // Supra returns prices in 1e18; core uses 1e6 => divide by 1e12
     // Must find matching pair, must be fresh <= 60s
-    function _oraclePrice6(uint32 assetId, bytes calldata supraProof) internal returns (uint256 price6) {
-        ISupraOraclePull.PriceInfo memory info = oracle.verifyOracleProofV2(supraProof);
+    function _oraclePrice6(
+        uint32 assetId,
+        bytes calldata supraProof
+    ) internal returns (uint256 price6) {
+        ISupraOraclePull.PriceInfo memory info = oracle.verifyOracleProofV2(
+            supraProof
+        );
 
         uint256 len = info.pairs.length;
         require(
             len > 0 &&
-            info.prices.length == len &&
-            info.timestamp.length == len,
+                info.prices.length == len &&
+                info.timestamp.length == len,
             "BAD_PROOF"
         );
 
@@ -261,7 +270,7 @@ contract BrokexCore {
         uint32 weekendFunding,
         uint16 securityMultiplier,
         uint16 maxPhysicalMove,
-        uint8  maxLeverage
+        uint8 maxLeverage
     ) external onlyOwner {
         require(!assets[assetId].listed, "ASSET_EXISTS");
         require(numerator >= 1 && denominator >= 1, "INVALID_LOT");
@@ -328,7 +337,7 @@ contract BrokexCore {
         uint32 commission,
         uint16 securityMultiplier,
         uint16 maxPhysicalMove,
-        uint8  maxLeverage
+        uint8 maxLeverage
     ) external onlyOwner {
         require(assets[assetId].listed, "ASSET_NOT_LISTED");
         require(maxPhysicalMove >= 1, "INVALID_PHYSICAL");
@@ -402,9 +411,7 @@ contract BrokexCore {
         uint256 r = (numerator * 1e18) / denominator;
         uint256 p = (r * r) / 1e18;
 
-        bool dominant =
-            (L > S && isLong) ||
-            (S > L && !isLong);
+        bool dominant = (L > S && isLong) || (S > L && !isLong);
 
         if (dominant) {
             return (base * (1e18 + 3 * p)) / 1e18;
@@ -436,7 +443,11 @@ contract BrokexCore {
 
         uint256 baseFunding = uint256(a.baseFundingRate);
 
-        (uint256 longRate, uint256 shortRate) = _computeFundingRate(L, S, baseFunding);
+        (uint256 longRate, uint256 shortRate) = _computeFundingRate(
+            L,
+            S,
+            baseFunding
+        );
 
         f.longFundingIndex += uint128(longRate);
         f.shortFundingIndex += uint128(shortRate);
@@ -467,7 +478,9 @@ contract BrokexCore {
         }
     }
 
-    function calculateWeekendFunding(uint256 tradeId) public view returns (uint256) {
+    function calculateWeekendFunding(
+        uint256 tradeId
+    ) public view returns (uint256) {
         Trade memory t = trades[tradeId];
         Asset memory a = assets[t.assetId];
 
@@ -479,11 +492,13 @@ contract BrokexCore {
         return (currentWeek - openWeek) * uint256(a.weekendFunding);
     }
 
-    function calculateLiquidationPrice(uint256 tradeId) public view returns (uint256) {
+    function calculateLiquidationPrice(
+        uint256 tradeId
+    ) public view returns (uint256) {
         Trade memory t = trades[tradeId];
         FundingState memory f = fundingStates[t.assetId];
 
-        uint256 openPrice = uint256(t.openPrice);     // 1e6
+        uint256 openPrice = uint256(t.openPrice); // 1e6
         uint256 lotSize = uint256(uint32(t.lotSize)); // lots
         uint256 leverage = uint256(t.leverage);
 
@@ -491,13 +506,22 @@ contract BrokexCore {
         uint256 margin = notional / leverage;
         uint256 liquidationLoss = (margin * 90) / 100;
 
-        uint256 spread = calculateSpread(t.assetId, !t.isLong, false, uint32(lotSize));
+        uint256 spread = calculateSpread(
+            t.assetId,
+            !t.isLong,
+            false,
+            uint32(lotSize)
+        );
 
         uint256 fundingDelta;
         if (t.isLong) {
-            fundingDelta = uint256(f.longFundingIndex) - uint256(t.fundingIndex);
+            fundingDelta =
+                uint256(f.longFundingIndex) -
+                uint256(t.fundingIndex);
         } else {
-            fundingDelta = uint256(f.shortFundingIndex) - uint256(t.fundingIndex);
+            fundingDelta =
+                uint256(f.shortFundingIndex) -
+                uint256(t.fundingIndex);
         }
 
         uint256 weekendFunding = calculateWeekendFunding(tradeId);
@@ -534,18 +558,17 @@ contract BrokexCore {
         uint256 marginUSDC6 = notionalUSDC6 / uint256(leverage);
         require(marginUSDC6 > 0, "MARGIN_0");
 
-        uint256 maxProfitLeverageUSDC6 =
-            (marginUSDC6 * uint256(a.securityMultiplier)) / 100;
+        uint256 maxProfitLeverageUSDC6 = (marginUSDC6 *
+            uint256(a.securityMultiplier)) / 100;
 
-        uint256 priceMove6 =
-            (entryPrice6 * uint256(a.maxPhysicalMove)) / 100;
+        uint256 priceMove6 = (entryPrice6 * uint256(a.maxPhysicalMove)) / 100;
 
-        uint256 physicalProfitUSDC6 =
-            priceMove6 * qtyUnits;
+        uint256 physicalProfitUSDC6 = priceMove6 * qtyUnits;
 
-        return (maxProfitLeverageUSDC6 < physicalProfitUSDC6)
-            ? maxProfitLeverageUSDC6
-            : physicalProfitUSDC6;
+        return
+            (maxProfitLeverageUSDC6 < physicalProfitUSDC6)
+                ? maxProfitLeverageUSDC6
+                : physicalProfitUSDC6;
     }
 
     function calculateInitialLiquidationPrice(
@@ -586,13 +609,17 @@ contract BrokexCore {
         shortLots = uint32(e.shortLots);
 
         if (e.longLots > 0) {
-            avgLongPrice = uint256(e.longValueSum) / uint256(uint32(e.longLots));
+            avgLongPrice =
+                uint256(e.longValueSum) /
+                uint256(uint32(e.longLots));
         } else {
             avgLongPrice = 0;
         }
 
         if (e.shortLots > 0) {
-            avgShortPrice = uint256(e.shortValueSum) / uint256(uint32(e.shortLots));
+            avgShortPrice =
+                uint256(e.shortValueSum) /
+                uint256(uint32(e.shortLots));
         } else {
             avgShortPrice = 0;
         }
@@ -620,8 +647,8 @@ contract BrokexCore {
         uint8 leverage,
         uint32 lots,
         uint48 targetPrice6, // 1e6
-        uint48 stopLoss,     // 1e6 (0 ignore)
-        uint48 takeProfit    // 1e6 (0 ignore)
+        uint48 stopLoss, // 1e6 (0 ignore)
+        uint48 takeProfit // 1e6 (0 ignore)
     ) external returns (uint256 tradeId) {
         _requireVaultSet();
         Asset memory a = _requireAssetListed(assetId);
@@ -642,7 +669,12 @@ contract BrokexCore {
         uint256 commissionUSDC6 = calculateCommission(assetId, notionalUSDC6);
 
         // LP lock based on target price (reservation logic)
-        uint256 lpLockUSDC6 = calculateLockedCapital(assetId, uint256(targetPrice6), lots, leverage);
+        uint256 lpLockUSDC6 = calculateLockedCapital(
+            assetId,
+            uint256(targetPrice6),
+            lots,
+            leverage
+        );
         require(lpLockUSDC6 > 0, "LPLOCK_0");
 
         tradeId = nextTradeID++;
@@ -665,7 +697,13 @@ contract BrokexCore {
 
         orderPriceOf[tradeId] = targetPrice6;
 
-        brokexVault.openOrder(tradeId, msg.sender, marginUSDC6, commissionUSDC6, lpLockUSDC6);
+        brokexVault.openOrder(
+            tradeId,
+            msg.sender,
+            marginUSDC6,
+            commissionUSDC6,
+            lpLockUSDC6
+        );
         emit TradeEvent(tradeId, 1); // 1 = order placed
     }
 
@@ -680,8 +718,8 @@ contract BrokexCore {
         bool isLong,
         uint8 leverage,
         uint32 lots,
-        uint48 stopLoss,      // 1e6 (0 ignore)
-        uint48 takeProfit,    // 1e6 (0 ignore)
+        uint48 stopLoss, // 1e6 (0 ignore)
+        uint48 takeProfit, // 1e6 (0 ignore)
         bytes calldata supraProof
     ) external returns (uint256 tradeId) {
         _requireVaultSet();
@@ -715,11 +753,18 @@ contract BrokexCore {
 
         uint256 commissionUSDC6 = calculateCommission(assetId, notionalUSDC6);
 
-        uint256 lpLockUSDC6 = calculateLockedCapital(assetId, oraclePx6, lots, leverage);
+        uint256 lpLockUSDC6 = calculateLockedCapital(
+            assetId,
+            oraclePx6,
+            lots,
+            leverage
+        );
         require(lpLockUSDC6 > 0, "LPLOCK_0");
 
         FundingState memory f = fundingStates[assetId];
-        uint256 idx = isLong ? uint256(f.longFundingIndex) : uint256(f.shortFundingIndex);
+        uint256 idx = isLong
+            ? uint256(f.longFundingIndex)
+            : uint256(f.shortFundingIndex);
         require(idx <= type(uint64).max, "FUNDINGIDX_OVERFLOW");
 
         tradeId = nextTradeID++;
@@ -740,9 +785,21 @@ contract BrokexCore {
         t.stopLoss = stopLoss;
         t.takeProfit = takeProfit;
 
-        _updateExposure(assetId, int32(uint32(lots)), uint48(entry6), isLong, true);
+        _updateExposure(
+            assetId,
+            int32(uint32(lots)),
+            uint48(entry6),
+            isLong,
+            true
+        );
 
-        brokexVault.openMarket(tradeId, msg.sender, marginUSDC6, commissionUSDC6, lpLockUSDC6);
+        brokexVault.openMarket(
+            tradeId,
+            msg.sender,
+            marginUSDC6,
+            commissionUSDC6,
+            lpLockUSDC6
+        );
         emit TradeEvent(tradeId, 2); // 2 = market opened
     }
 
@@ -754,200 +811,550 @@ contract BrokexCore {
     // - updates exposure
     // - calls vault.executeOrder(tradeId)
     function executeOrder(uint256 tradeId, bytes calldata supraProof) external {
-    _requireVaultSet();
+        _requireVaultSet();
 
-    Trade storage t = trades[tradeId];
-    require(t.state == 0, "BAD_STATE");              // must be an ORDER
-    require(t.trader != address(0), "NO_TRADE");
+        Trade storage t = trades[tradeId];
+        require(t.state == 0, "BAD_STATE"); // must be an ORDER
+        require(t.trader != address(0), "NO_TRADE");
 
-    uint48 target6 = orderPriceOf[tradeId];
-    require(target6 > 0, "NO_TARGET");
+        uint48 target6 = orderPriceOf[tradeId];
+        require(target6 > 0, "NO_TARGET");
 
-    // Safety: lotSize must be positive (stored as int32)
-    require(t.lotSize > 0, "LOTS_0");
-    uint32 lots = uint32(uint256(int256(t.lotSize)));
+        // Safety: lotSize must be positive (stored as int32)
+        require(t.lotSize > 0, "LOTS_0");
+        uint32 lots = uint32(uint256(int256(t.lotSize)));
 
-    // 1) Read oracle price (1e6) and validate proof freshness + asset match
-    uint256 oraclePx6 = _oraclePrice6(t.assetId, supraProof); // reverts if stale / pair not found
+        // 1) Read oracle price (1e6) and validate proof freshness + asset match
+        uint256 oraclePx6 = _oraclePrice6(t.assetId, supraProof); // reverts if stale / pair not found
 
-    // 2) Execute only if oracle price is equal-or-better than target for the trader
-    //    - LONG wants price <= target
-    //    - SHORT wants price >= target
-    if (t.isLong) {
-        require(oraclePx6 <= uint256(target6), "PRICE_WORSE_THAN_TARGET");
-    } else {
-        require(oraclePx6 >= uint256(target6), "PRICE_WORSE_THAN_TARGET");
-    }
-
-    // 3) Apply spread on top of oracle price (worse for trader)
-    uint256 spread6 = calculateSpread(t.assetId, t.isLong, true, lots);
-
-    uint256 entry6;
-    if (t.isLong) {
-        entry6 = oraclePx6 + spread6;
-    } else {
-        require(oraclePx6 > spread6, "SPREAD_GT_PRICE");
-        entry6 = oraclePx6 - spread6;
-    }
-    require(entry6 <= type(uint48).max, "ENTRY_OVERFLOW");
-
-    // 4) Re-check SL/TP against the *real* entry price (with spread)
-    _validateSLTP(t.isLong, entry6, t.stopLoss, t.takeProfit);
-
-    // 5) Snapshot funding index now (only when it becomes a position)
-    FundingState memory f = fundingStates[t.assetId];
-    uint256 idx = t.isLong ? uint256(f.longFundingIndex) : uint256(f.shortFundingIndex);
-    require(idx <= type(uint64).max, "FUNDINGIDX_OVERFLOW");
-
-    // 6) Write position fields (order -> market position)
-    t.openPrice = uint48(entry6);
-    t.openTimestamp = uint32(block.timestamp);
-    t.fundingIndex = uint64(idx);
-    t.state = 1;
-
-    // 7) Update exposure exactly like a market open
-    _updateExposure(t.assetId, t.lotSize, uint48(entry6), t.isLong, true);
-
-    // 8) Tell vault to finalize: it will consume held commission and lock LP capital
-    brokexVault.executeOrder(tradeId);
-
-    // 9) Clear target mapping (optional but propre)
-    delete orderPriceOf[tradeId];
-
-    // 10) Emit event: 2 = position opened (market/executed)
-    emit TradeEvent(tradeId, 2);
-}
-
-uint8 public constant CLOSE_SL = 1;
-uint8 public constant CLOSE_TP = 2;
-
-function _closePositionWithOraclePrice(
-    uint256 tradeId,
-    uint256 oraclePx6
-) internal {
-    _requireVaultSet();
-
-    Trade storage t = trades[tradeId];
-    require(t.state == 1, "NOT_OPEN");
-
-    require(t.lotSize > 0, "LOTS_0");
-    uint32 lots = uint32(uint256(int256(t.lotSize)));
-
-    // Spread de fermeture (toujours défavorable au trader)
-    uint256 spreadClose6 = calculateSpread(t.assetId, !t.isLong, false, lots);
-
-    uint256 closePx6;
-    if (t.isLong) {
-        // Long ferme sur un prix "bid" => oracle - spread
-        require(oraclePx6 > spreadClose6, "SPREAD_GT_PRICE");
-        closePx6 = oraclePx6 - spreadClose6;
-    } else {
-        // Short ferme sur un prix "ask" => oracle + spread
-        closePx6 = oraclePx6 + spreadClose6;
-    }
-    require(closePx6 <= type(uint48).max, "CLOSE_OVERFLOW");
-
-    // Funding delta depuis l'ouverture (index snapshot)
-    FundingState memory f = fundingStates[t.assetId];
-    uint256 fundingDelta;
-    if (t.isLong) {
-        // index doit être monotone, sinon underflow
-        require(uint256(f.longFundingIndex) >= uint256(t.fundingIndex), "FUNDING_UNDERFLOW");
-        fundingDelta = uint256(f.longFundingIndex) - uint256(t.fundingIndex);
-    } else {
-        require(uint256(f.shortFundingIndex) >= uint256(t.fundingIndex), "FUNDING_UNDERFLOW");
-        fundingDelta = uint256(f.shortFundingIndex) - uint256(t.fundingIndex);
-    }
-
-    // Quantité en "units" (numerator/denominator) pour convertir en USDC6
-    Asset memory a = assets[t.assetId];
-    uint256 qtyUnits = _lotQtyUnits(a, lots);
-    require(qtyUnits > 0, "QTY_0");
-
-    // --- PnL brut en USDC6 (sans funding) ---
-    // PnL long = (close - open) * qty
-    // PnL short = (open - close) * qty
-    int256 pnlUSDC6;
-    if (t.isLong) {
-        pnlUSDC6 = int256(closePx6) - int256(uint256(t.openPrice));
-    } else {
-        pnlUSDC6 = int256(uint256(t.openPrice)) - int256(closePx6);
-    }
-    pnlUSDC6 = pnlUSDC6 * int256(qtyUnits);
-
-    // Funding appliqué "contre le trader" (selon ton design)
-    // Ici on soustrait fundingDelta*qtyUnits au PnL du trader.
-    // (Si tu veux un funding qui dépend du sens/exposition, tu adapteras plus tard.)
-    int256 fundingCostUSDC6 = int256(fundingDelta * qtyUnits);
-    pnlUSDC6 = pnlUSDC6 - fundingCostUSDC6;
-
-    // Convertir en X6 pour le vault (pnlX6: int256)
-    int256 pnlX6 = pnlUSDC6;
-
-    // Update exposure (on retire la position)
-    _updateExposure(t.assetId, t.lotSize, t.openPrice, t.isLong, false);
-
-    // Marquer fermé
-    t.closePrice = uint48(closePx6);
-    t.state = 2;
-
-    // Appel vault: si pnlX6 > 0 trader gagne, si <0 trader perd
-    brokexVault.closeTrade(tradeId, pnlX6);
-
-    // Event code 4 = position fermée (comme tu veux)
-    emit TradeEvent(tradeId, 4);
-}
-
-function closeMarket(uint256 tradeId, bytes calldata supraProof) external {
-    Trade storage t = trades[tradeId];
-    require(t.state == 1, "NOT_OPEN");
-    require(t.trader == msg.sender, "NOT_TRADER");
-
-    uint256 oraclePx6 = _oraclePrice6(t.assetId, supraProof);
-    _closePositionWithOraclePrice(tradeId, oraclePx6);
-}
-
-function closeOnSLTP(
-    uint256 tradeId,
-    uint8 mode,               // 1 = SL, 2 = TP
-    bytes calldata supraProof
-) external {
-    Trade storage t = trades[tradeId];
-    require(t.state == 1, "NOT_OPEN");
-
-    uint256 oraclePx6 = _oraclePrice6(t.assetId, supraProof);
-
-    if (mode == CLOSE_SL) {
-        uint48 sl = t.stopLoss;
-        require(sl != 0, "NO_SL");
-
+        // 2) Execute only if oracle price is equal-or-better than target for the trader
+        //    - LONG wants price <= target
+        //    - SHORT wants price >= target
         if (t.isLong) {
-            // Long SL déclenche si oracle <= SL (pire ou égal)
-            require(oraclePx6 <= uint256(sl), "SL_NOT_HIT");
+            require(oraclePx6 <= uint256(target6), "PRICE_WORSE_THAN_TARGET");
         } else {
-            // Short SL déclenche si oracle >= SL (pire ou égal)
-            require(oraclePx6 >= uint256(sl), "SL_NOT_HIT");
+            require(oraclePx6 >= uint256(target6), "PRICE_WORSE_THAN_TARGET");
         }
-    } else if (mode == CLOSE_TP) {
-        uint48 tp = t.takeProfit;
-        require(tp != 0, "NO_TP");
 
+        // 3) Apply spread on top of oracle price (worse for trader)
+        uint256 spread6 = calculateSpread(t.assetId, t.isLong, true, lots);
+
+        uint256 entry6;
         if (t.isLong) {
-            // Long TP déclenche si oracle >= TP (meilleur ou égal)
-            require(oraclePx6 >= uint256(tp), "TP_NOT_HIT");
+            entry6 = oraclePx6 + spread6;
         } else {
-            // Short TP déclenche si oracle <= TP (meilleur ou égal)
-            require(oraclePx6 <= uint256(tp), "TP_NOT_HIT");
+            require(oraclePx6 > spread6, "SPREAD_GT_PRICE");
+            entry6 = oraclePx6 - spread6;
         }
-    } else {
-        revert("BAD_MODE");
+        require(entry6 <= type(uint48).max, "ENTRY_OVERFLOW");
+
+        // 4) Re-check SL/TP against the *real* entry price (with spread)
+        _validateSLTP(t.isLong, entry6, t.stopLoss, t.takeProfit);
+
+        // 5) Snapshot funding index now (only when it becomes a position)
+        FundingState memory f = fundingStates[t.assetId];
+        uint256 idx = t.isLong
+            ? uint256(f.longFundingIndex)
+            : uint256(f.shortFundingIndex);
+        require(idx <= type(uint64).max, "FUNDINGIDX_OVERFLOW");
+
+        // 6) Write position fields (order -> market position)
+        t.openPrice = uint48(entry6);
+        t.openTimestamp = uint32(block.timestamp);
+        t.fundingIndex = uint64(idx);
+        t.state = 1;
+
+        // 7) Update exposure exactly like a market open
+        _updateExposure(t.assetId, t.lotSize, uint48(entry6), t.isLong, true);
+
+        // 8) Tell vault to finalize: it will consume held commission and lock LP capital
+        brokexVault.executeOrder(tradeId);
+
+        // 9) Clear target mapping (optional but propre)
+        delete orderPriceOf[tradeId];
+
+        // 10) Emit event: 2 = position opened (market/executed)
+        emit TradeEvent(tradeId, 2);
     }
 
-    _closePositionWithOraclePrice(tradeId, oraclePx6);
-}
+    uint8 public constant CLOSE_SL = 1;
+    uint8 public constant CLOSE_TP = 2;
 
+    function _closePositionWithOraclePrice(
+        uint256 tradeId,
+        uint256 oraclePx6
+    ) internal {
+        _requireVaultSet();
 
+        Trade storage t = trades[tradeId];
+        require(t.state == 1, "NOT_OPEN");
 
+        require(t.lotSize > 0, "LOTS_0");
+        uint32 lots = uint32(uint256(int256(t.lotSize)));
 
+        // Spread de fermeture (toujours défavorable au trader)
+        uint256 spreadClose6 = calculateSpread(
+            t.assetId,
+            !t.isLong,
+            false,
+            lots
+        );
+
+        uint256 closePx6;
+        if (t.isLong) {
+            // Long ferme sur un prix "bid" => oracle - spread
+            require(oraclePx6 > spreadClose6, "SPREAD_GT_PRICE");
+            closePx6 = oraclePx6 - spreadClose6;
+        } else {
+            // Short ferme sur un prix "ask" => oracle + spread
+            closePx6 = oraclePx6 + spreadClose6;
+        }
+        require(closePx6 <= type(uint48).max, "CLOSE_OVERFLOW");
+
+        // Funding delta depuis l'ouverture (index snapshot)
+        FundingState memory f = fundingStates[t.assetId];
+        uint256 fundingDelta;
+        if (t.isLong) {
+            // index doit être monotone, sinon underflow
+            require(
+                uint256(f.longFundingIndex) >= uint256(t.fundingIndex),
+                "FUNDING_UNDERFLOW"
+            );
+            fundingDelta =
+                uint256(f.longFundingIndex) -
+                uint256(t.fundingIndex);
+        } else {
+            require(
+                uint256(f.shortFundingIndex) >= uint256(t.fundingIndex),
+                "FUNDING_UNDERFLOW"
+            );
+            fundingDelta =
+                uint256(f.shortFundingIndex) -
+                uint256(t.fundingIndex);
+        }
+
+        // Quantité en "units" (numerator/denominator) pour convertir en USDC6
+        Asset memory a = assets[t.assetId];
+        uint256 qtyUnits = _lotQtyUnits(a, lots);
+        require(qtyUnits > 0, "QTY_0");
+
+        // --- PnL brut en USDC6 (sans funding) ---
+        // PnL long = (close - open) * qty
+        // PnL short = (open - close) * qty
+        int256 pnlUSDC6;
+        if (t.isLong) {
+            pnlUSDC6 = int256(closePx6) - int256(uint256(t.openPrice));
+        } else {
+            pnlUSDC6 = int256(uint256(t.openPrice)) - int256(closePx6);
+        }
+        pnlUSDC6 = pnlUSDC6 * int256(qtyUnits);
+
+        // Funding appliqué "contre le trader" (selon ton design)
+        // Ici on soustrait fundingDelta*qtyUnits au PnL du trader.
+        // (Si tu veux un funding qui dépend du sens/exposition, tu adapteras plus tard.)
+        int256 fundingCostUSDC6 = int256(fundingDelta * qtyUnits);
+        pnlUSDC6 = pnlUSDC6 - fundingCostUSDC6;
+
+        // Convertir en X6 pour le vault (pnlX6: int256)
+        int256 pnlX6 = pnlUSDC6;
+
+        // Update exposure (on retire la position)
+        _updateExposure(t.assetId, t.lotSize, t.openPrice, t.isLong, false);
+
+        // Marquer fermé
+        t.closePrice = uint48(closePx6);
+        t.state = 2;
+
+        // Appel vault: si pnlX6 > 0 trader gagne, si <0 trader perd
+        brokexVault.closeTrade(tradeId, pnlX6);
+
+        // Event code 4 = position fermée (comme tu veux)
+        emit TradeEvent(tradeId, 4);
+    }
+
+    function closeMarket(uint256 tradeId, bytes calldata supraProof) external {
+        Trade storage t = trades[tradeId];
+        require(t.state == 1, "NOT_OPEN");
+        require(t.trader == msg.sender, "NOT_TRADER");
+
+        uint256 oraclePx6 = _oraclePrice6(t.assetId, supraProof);
+        _closePositionWithOraclePrice(tradeId, oraclePx6);
+    }
+
+    function closeOnSLTP(
+        uint256 tradeId,
+        uint8 mode, // 1 = SL, 2 = TP
+        bytes calldata supraProof
+    ) external {
+        Trade storage t = trades[tradeId];
+        require(t.state == 1, "NOT_OPEN");
+
+        uint256 oraclePx6 = _oraclePrice6(t.assetId, supraProof);
+
+        if (mode == CLOSE_SL) {
+            uint48 sl = t.stopLoss;
+            require(sl != 0, "NO_SL");
+
+            if (t.isLong) {
+                // Long SL déclenche si oracle <= SL (pire ou égal)
+                require(oraclePx6 <= uint256(sl), "SL_NOT_HIT");
+            } else {
+                // Short SL déclenche si oracle >= SL (pire ou égal)
+                require(oraclePx6 >= uint256(sl), "SL_NOT_HIT");
+            }
+        } else if (mode == CLOSE_TP) {
+            uint48 tp = t.takeProfit;
+            require(tp != 0, "NO_TP");
+
+            if (t.isLong) {
+                // Long TP déclenche si oracle >= TP (meilleur ou égal)
+                require(oraclePx6 >= uint256(tp), "TP_NOT_HIT");
+            } else {
+                // Short TP déclenche si oracle <= TP (meilleur ou égal)
+                require(oraclePx6 <= uint256(tp), "TP_NOT_HIT");
+            }
+        } else {
+            revert("BAD_MODE");
+        }
+
+        _closePositionWithOraclePrice(tradeId, oraclePx6);
+    }
+
+    /* ===================== */
+    /* CANCEL / LIQUIDATE     */
+    /* ===================== */
+
+    // Cancel an ORDER (state 0 -> 3), only trader
+    function cancelOrder(uint256 tradeId) external {
+        _requireVaultSet();
+
+        Trade storage t = trades[tradeId];
+        require(t.trader != address(0), "NO_TRADE");
+        require(t.state == 0, "BAD_STATE");
+        require(msg.sender == t.trader, "NOT_TRADER");
+
+        // state transition: 0 -> 3
+        t.state = 3;
+
+        // tell vault to release reserved margin/commission/lock logic
+        brokexVault.cancelOrder(tradeId);
+
+        // cleanup target price mapping
+        delete orderPriceOf[tradeId];
+
+        // event code 3 = order cancelled
+        emit TradeEvent(tradeId, 3);
+    }
+
+    // Liquidate an OPEN position (state 11 -> 2) using Supra proof
+    // Anyone can call (keepers)
+    function liquidatePosition(
+        uint256 tradeId,
+        bytes calldata supraProof
+    ) external {
+        _requireVaultSet();
+
+        Trade storage t = trades[tradeId];
+        require(t.trader != address(0), "NO_TRADE");
+        require(t.state == 1, "BAD_STATE"); // must be open position
+
+        // oracle price (1e6) + freshness <= 60s + pair match
+        uint256 oraclePx6 = _oraclePrice6(t.assetId, supraProof);
+
+        // compute liquidation price (1e6) from your helper
+        uint256 liqPrice6 = calculateLiquidationPrice(tradeId);
+
+        // Liquidation condition:
+        // - LONG liquidates if oracle <= liqPrice (equal or worse)
+        // - SHORT liquidates if oracle >= liqPrice (equal or worse)
+        if (t.isLong) {
+            require(oraclePx6 <= liqPrice6, "NOT_LIQUIDATABLE");
+        } else {
+            require(oraclePx6 >= liqPrice6, "NOT_LIQUIDATABLE");
+        }
+
+        // remove from exposure (position leaves the book)
+        _updateExposure(t.assetId, t.lotSize, t.openPrice, t.isLong, false);
+
+        // optional: store close price (oracle, without spread), capped to uint48
+        require(oraclePx6 <= type(uint48).max, "CLOSE_OVERFLOW");
+        t.closePrice = uint48(oraclePx6);
+
+        // state: 1 -> 2
+        t.state = 2;
+
+        // call vault liquidation
+        brokexVault.liquidateTrade(tradeId);
+
+        // event code 4 = position closed (liquidated)
+        emit TradeEvent(tradeId, 4);
+    }
+
+    /* ===================== */
+    /* SL / TP UPDATES        */
+    /* ===================== */
+
+    function _applySLTP(
+        Trade storage t,
+        uint48 newStopLoss,
+        uint48 newTakeProfit
+    ) internal {
+        // validate vs openPrice only (as requested)
+        _validateSLTP(
+            t.isLong,
+            uint256(t.openPrice),
+            newStopLoss,
+            newTakeProfit
+        );
+
+        t.stopLoss = newStopLoss;
+        t.takeProfit = newTakeProfit;
+    }
+
+    // Update both SL and TP (only trader)
+    function updateStopLossTakeProfit(
+        uint256 tradeId,
+        uint48 newStopLoss,
+        uint48 newTakeProfit
+    ) external {
+        Trade storage t = trades[tradeId];
+        require(t.trader != address(0), "NO_TRADE");
+        require(t.state == 1, "BAD_STATE");
+        require(msg.sender == t.trader, "NOT_TRADER");
+
+        _applySLTP(t, newStopLoss, newTakeProfit);
+
+        // event code 5 = SL/TP updated
+        emit TradeEvent(tradeId, 5);
+    }
+
+    // Update SL only (only trader)
+    function updateStopLoss(uint256 tradeId, uint48 newStopLoss) external {
+        Trade storage t = trades[tradeId];
+        require(t.trader != address(0), "NO_TRADE");
+        require(t.state == 1, "BAD_STATE");
+        require(msg.sender == t.trader, "NOT_TRADER");
+
+        _applySLTP(t, newStopLoss, t.takeProfit);
+
+        emit TradeEvent(tradeId, 5);
+    }
+
+    // Update TP only (only trader)
+    function updateTakeProfit(uint256 tradeId, uint48 newTakeProfit) external {
+        Trade storage t = trades[tradeId];
+        require(t.trader != address(0), "NO_TRADE");
+        require(t.state == 1, "BAD_STATE");
+        require(msg.sender == t.trader, "NOT_TRADER");
+
+        _applySLTP(t, t.stopLoss, newTakeProfit);
+
+        emit TradeEvent(tradeId, 5);
+    }
+
+    address public paymaster;
+
+    modifier onlyPaymaster() {
+        require(msg.sender == paymaster, "ONLY_PAYMASTER");
+        _;
+    }
+
+    function setPaymaster(address pm) external onlyOwner {
+        require(pm != address(0), "ZERO_PM");
+        paymaster = pm;
+    }
+
+    function pmOpenLimitOrder(
+        address trader,
+        uint32 assetId,
+        bool isLong,
+        uint8 leverage,
+        uint32 lots,
+        uint48 targetPrice6,
+        uint48 stopLoss,
+        uint48 takeProfit
+    ) external onlyPaymaster returns (uint256 tradeId) {
+        require(trader != address(0), "ZERO_TRADER");
+
+        _requireVaultSet();
+        Asset memory a = _requireAssetListed(assetId);
+        _requireValidLeverage(a, leverage);
+
+        require(lots > 0, "LOTS_0");
+        require(targetPrice6 > 0, "TARGET_0");
+
+        _validateSLTP(isLong, uint256(targetPrice6), stopLoss, takeProfit);
+
+        uint256 qtyUnits = _lotQtyUnits(a, lots);
+        require(qtyUnits > 0, "QTY_0");
+
+        uint256 notionalUSDC6 = uint256(targetPrice6) * qtyUnits;
+        uint256 marginUSDC6 = notionalUSDC6 / uint256(leverage);
+        require(marginUSDC6 > 0, "MARGIN_0");
+
+        uint256 commissionUSDC6 = calculateCommission(assetId, notionalUSDC6);
+
+        uint256 lpLockUSDC6 = calculateLockedCapital(
+            assetId,
+            uint256(targetPrice6),
+            lots,
+            leverage
+        );
+        require(lpLockUSDC6 > 0, "LPLOCK_0");
+
+        tradeId = nextTradeID++;
+        Trade storage t = trades[tradeId];
+
+        t.trader = trader;
+        t.assetId = assetId;
+        t.isLong = isLong;
+        t.leverage = leverage;
+
+        t.openPrice = 0;
+        t.state = 0;
+        t.openTimestamp = 0;
+        t.fundingIndex = 0;
+
+        t.closePrice = 0;
+        t.lotSize = int32(uint32(lots));
+        t.stopLoss = stopLoss;
+        t.takeProfit = takeProfit;
+
+        orderPriceOf[tradeId] = targetPrice6;
+
+        brokexVault.openOrder(
+            tradeId,
+            trader,
+            marginUSDC6,
+            commissionUSDC6,
+            lpLockUSDC6
+        );
+        emit TradeEvent(tradeId, 1);
+    }
+
+    function pmOpenMarketPosition(
+        address trader,
+        uint32 assetId,
+        bool isLong,
+        uint8 leverage,
+        uint32 lots,
+        uint48 stopLoss,
+        uint48 takeProfit,
+        bytes calldata supraProof
+    ) external onlyPaymaster returns (uint256 tradeId) {
+        require(trader != address(0), "ZERO_TRADER");
+
+        _requireVaultSet();
+        Asset memory a = _requireAssetListed(assetId);
+        _requireValidLeverage(a, leverage);
+
+        require(lots > 0, "LOTS_0");
+
+        uint256 oraclePx6 = _oraclePrice6(assetId, supraProof);
+        uint256 spread6 = calculateSpread(assetId, isLong, true, lots);
+
+        uint256 entry6;
+        if (isLong) {
+            entry6 = oraclePx6 + spread6;
+        } else {
+            require(oraclePx6 > spread6, "SPREAD_GT_PRICE");
+            entry6 = oraclePx6 - spread6;
+        }
+        require(entry6 <= type(uint48).max, "ENTRY_OVERFLOW");
+
+        _validateSLTP(isLong, entry6, stopLoss, takeProfit);
+
+        uint256 qtyUnits = _lotQtyUnits(a, lots);
+        require(qtyUnits > 0, "QTY_0");
+
+        uint256 notionalUSDC6 = oraclePx6 * qtyUnits;
+        uint256 marginUSDC6 = notionalUSDC6 / uint256(leverage);
+        require(marginUSDC6 > 0, "MARGIN_0");
+
+        uint256 commissionUSDC6 = calculateCommission(assetId, notionalUSDC6);
+
+        uint256 lpLockUSDC6 = calculateLockedCapital(
+            assetId,
+            oraclePx6,
+            lots,
+            leverage
+        );
+        require(lpLockUSDC6 > 0, "LPLOCK_0");
+
+        FundingState memory f = fundingStates[assetId];
+        uint256 idx = isLong
+            ? uint256(f.longFundingIndex)
+            : uint256(f.shortFundingIndex);
+        require(idx <= type(uint64).max, "FUNDINGIDX_OVERFLOW");
+
+        tradeId = nextTradeID++;
+        Trade storage t = trades[tradeId];
+
+        t.trader = trader;
+        t.assetId = assetId;
+        t.isLong = isLong;
+        t.leverage = leverage;
+
+        t.openPrice = uint48(entry6);
+        t.state = 1;
+        t.openTimestamp = uint32(block.timestamp);
+        t.fundingIndex = uint64(idx);
+
+        t.closePrice = 0;
+        t.lotSize = int32(uint32(lots));
+        t.stopLoss = stopLoss;
+        t.takeProfit = takeProfit;
+
+        _updateExposure(
+            assetId,
+            int32(uint32(lots)),
+            uint48(entry6),
+            isLong,
+            true
+        );
+
+        brokexVault.openMarket(
+            tradeId,
+            trader,
+            marginUSDC6,
+            commissionUSDC6,
+            lpLockUSDC6
+        );
+        emit TradeEvent(tradeId, 2);
+    }
+
+    function pmCancelOrder(
+        address trader,
+        uint256 tradeId
+    ) external onlyPaymaster {
+        require(trader != address(0), "ZERO_TRADER");
+        _requireVaultSet();
+
+        Trade storage t = trades[tradeId];
+        require(t.trader == trader, "BAD_TRADER");
+        require(t.state == 0, "BAD_STATE");
+
+        t.state = 3;
+
+        brokexVault.cancelOrder(tradeId);
+        delete orderPriceOf[tradeId];
+
+        emit TradeEvent(tradeId, 3);
+    }
+
+    function pmCloseMarket(
+        address trader,
+        uint256 tradeId,
+        bytes calldata supraProof
+    ) external onlyPaymaster {
+        require(trader != address(0), "ZERO_TRADER");
+
+        Trade storage t = trades[tradeId];
+        require(t.trader == trader, "BAD_TRADER");
+        require(t.state == 1, "NOT_OPEN");
+
+        uint256 oraclePx6 = _oraclePrice6(t.assetId, supraProof);
+        _closePositionWithOraclePrice(tradeId, oraclePx6);
+    }
 }
 
