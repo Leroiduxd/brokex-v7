@@ -260,16 +260,7 @@ contract BrokexVault {
         nextWithdrawEpochToFund = 0;
     }
 
-    function setCore(address newCore) external onlyOwner {
-       // 1. On vérifie que le core n'est pas déjà défini (qu'il est égal à 0)
-       require(core == address(0), "CORE_ALREADY_SET");
-   
-       // 2. On vérifie que la nouvelle adresse n'est pas 0
-       require(newCore != address(0), "ZERO_CORE");
-   
-       core = newCore;
-       coreReader = IBrokexCoreRead(newCore);
-   }
+    
 
     function setOwner(address newOwner) external onlyOwner {
         require(newOwner != address(0), "ZERO_OWNER");
