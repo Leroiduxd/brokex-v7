@@ -818,4 +818,136 @@ contract BrokexCore {
     emit TradeEvent(tradeId, 2);
 }
 
+uint8 public constant CLOSE_SL = 1;
+uint8 public constant CLOSE_TP = 2;
+
+function _closePositionWithOraclePrice(
+    uint256 tradeId,
+    uint256 oraclePx6
+) internal {
+    _requireVaultSet();
+
+    Trade storage t = trades[tradeId];
+    require(t.state == 1, "NOT_OPEN");
+
+    require(t.lotSize > 0, "LOTS_0");
+    uint32 lots = uint32(uint256(int256(t.lotSize)));
+
+    // Spread de fermeture (toujours défavorable au trader)
+    uint256 spreadClose6 = calculateSpread(t.assetId, !t.isLong, false, lots);
+
+    uint256 closePx6;
+    if (t.isLong) {
+        // Long ferme sur un prix "bid" => oracle - spread
+        require(oraclePx6 > spreadClose6, "SPREAD_GT_PRICE");
+        closePx6 = oraclePx6 - spreadClose6;
+    } else {
+        // Short ferme sur un prix "ask" => oracle + spread
+        closePx6 = oraclePx6 + spreadClose6;
+    }
+    require(closePx6 <= type(uint48).max, "CLOSE_OVERFLOW");
+
+    // Funding delta depuis l'ouverture (index snapshot)
+    FundingState memory f = fundingStates[t.assetId];
+    uint256 fundingDelta;
+    if (t.isLong) {
+        // index doit être monotone, sinon underflow
+        require(uint256(f.longFundingIndex) >= uint256(t.fundingIndex), "FUNDING_UNDERFLOW");
+        fundingDelta = uint256(f.longFundingIndex) - uint256(t.fundingIndex);
+    } else {
+        require(uint256(f.shortFundingIndex) >= uint256(t.fundingIndex), "FUNDING_UNDERFLOW");
+        fundingDelta = uint256(f.shortFundingIndex) - uint256(t.fundingIndex);
+    }
+
+    // Quantité en "units" (numerator/denominator) pour convertir en USDC6
+    Asset memory a = assets[t.assetId];
+    uint256 qtyUnits = _lotQtyUnits(a, lots);
+    require(qtyUnits > 0, "QTY_0");
+
+    // --- PnL brut en USDC6 (sans funding) ---
+    // PnL long = (close - open) * qty
+    // PnL short = (open - close) * qty
+    int256 pnlUSDC6;
+    if (t.isLong) {
+        pnlUSDC6 = int256(closePx6) - int256(uint256(t.openPrice));
+    } else {
+        pnlUSDC6 = int256(uint256(t.openPrice)) - int256(closePx6);
+    }
+    pnlUSDC6 = pnlUSDC6 * int256(qtyUnits);
+
+    // Funding appliqué "contre le trader" (selon ton design)
+    // Ici on soustrait fundingDelta*qtyUnits au PnL du trader.
+    // (Si tu veux un funding qui dépend du sens/exposition, tu adapteras plus tard.)
+    int256 fundingCostUSDC6 = int256(fundingDelta * qtyUnits);
+    pnlUSDC6 = pnlUSDC6 - fundingCostUSDC6;
+
+    // Convertir en X6 pour le vault (pnlX6: int256)
+    int256 pnlX6 = pnlUSDC6;
+
+    // Update exposure (on retire la position)
+    _updateExposure(t.assetId, t.lotSize, t.openPrice, t.isLong, false);
+
+    // Marquer fermé
+    t.closePrice = uint48(closePx6);
+    t.state = 2;
+
+    // Appel vault: si pnlX6 > 0 trader gagne, si <0 trader perd
+    brokexVault.closeTrade(tradeId, pnlX6);
+
+    // Event code 4 = position fermée (comme tu veux)
+    emit TradeEvent(tradeId, 4);
 }
+
+function closeMarket(uint256 tradeId, bytes calldata supraProof) external {
+    Trade storage t = trades[tradeId];
+    require(t.state == 1, "NOT_OPEN");
+    require(t.trader == msg.sender, "NOT_TRADER");
+
+    uint256 oraclePx6 = _oraclePrice6(t.assetId, supraProof);
+    _closePositionWithOraclePrice(tradeId, oraclePx6);
+}
+
+function closeOnSLTP(
+    uint256 tradeId,
+    uint8 mode,               // 1 = SL, 2 = TP
+    bytes calldata supraProof
+) external {
+    Trade storage t = trades[tradeId];
+    require(t.state == 1, "NOT_OPEN");
+
+    uint256 oraclePx6 = _oraclePrice6(t.assetId, supraProof);
+
+    if (mode == CLOSE_SL) {
+        uint48 sl = t.stopLoss;
+        require(sl != 0, "NO_SL");
+
+        if (t.isLong) {
+            // Long SL déclenche si oracle <= SL (pire ou égal)
+            require(oraclePx6 <= uint256(sl), "SL_NOT_HIT");
+        } else {
+            // Short SL déclenche si oracle >= SL (pire ou égal)
+            require(oraclePx6 >= uint256(sl), "SL_NOT_HIT");
+        }
+    } else if (mode == CLOSE_TP) {
+        uint48 tp = t.takeProfit;
+        require(tp != 0, "NO_TP");
+
+        if (t.isLong) {
+            // Long TP déclenche si oracle >= TP (meilleur ou égal)
+            require(oraclePx6 >= uint256(tp), "TP_NOT_HIT");
+        } else {
+            // Short TP déclenche si oracle <= TP (meilleur ou égal)
+            require(oraclePx6 <= uint256(tp), "TP_NOT_HIT");
+        }
+    } else {
+        revert("BAD_MODE");
+    }
+
+    _closePositionWithOraclePrice(tradeId, oraclePx6);
+}
+
+
+
+
+}
+
