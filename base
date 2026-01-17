@@ -1,0 +1,551 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/*
+    BrokexVault (virtual accounting, test-friendly)
+
+    - Traders:
+        freeBalance / lockedBalance (virtual USDC-like amounts, 6 decimals)
+        orders/positions with margin + commission
+        LP is the counterparty (Book B): trader profit = LP loss, trader loss = LP gain
+        LP "liability lock" per trade => requires enough lpFreeCapital to open/execute
+
+    - LPs (Epoch + Lazy Evaluation):
+        Epoch duration: 24h (enforced by timestamp)
+        LPs place deposit requests into the CURRENT epoch queue (pendingDeposit).
+        They can reduce/cancel while epoch is current.
+
+        At epoch rollover:
+            1) snapshot end-of-epoch price: lpTokenPrice[epoch] (18 decimals)
+               price is computed from equity:
+                    equity18 = (lpFree + lpLocked) converted to 18 decimals - unrealizedPnlTraders18
+               then:
+                    if totalShares == 0 => price = 1e18 (1.0)
+                    else price = equity18 * 1e18 / totalShares
+
+            2) mint shares globally for the epoch deposits:
+                    mintedShares = deposit18 * 1e18 / price
+               update totalShares
+
+            3) move deposits into lpFreeCapital (they start working next epoch)
+               reset queue by incrementing epoch and setting new start time
+
+        Lazy evaluation:
+            We do NOT credit per-LP shares at rollover.
+            We only store per-LP deposits per epoch + prices per epoch.
+            A view function can compute a LP's shares by iterating their epochs list.
+*/
+
+contract BrokexVault {
+    // -----------------------------
+    // Constants / units
+    // -----------------------------
+    uint8 public constant STABLE_DECIMALS = 6;   // "USDC-like" unit
+    uint256 private constant WAD = 1e18;
+    uint256 private constant USDC_TO_WAD = 1e12; // 1e6 -> 1e18
+
+    // -----------------------------
+    // Roles
+    // -----------------------------
+    address public owner;
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    // -----------------------------
+    // Trader balances (virtual)
+    // -----------------------------
+    mapping(address => uint256) public freeBalance;   // 6 decimals
+    mapping(address => uint256) public lockedBalance; // 6 decimals
+
+    // -----------------------------
+    // LP capital accounting (virtual)
+    // -----------------------------
+    uint256 public lpFreeCapital;    // 6 decimals, available to back new positions
+    uint256 public lpLockedCapital;  // 6 decimals, reserved by open positions (liability lock)
+
+    // -----------------------------
+    // Trades
+    // -----------------------------
+    enum TradeState {
+        Pending,
+        Open,
+        Closed,
+        Cancelled
+    }
+
+    struct Trade {
+        uint256 id;
+        address owner;
+        uint256 margin;         // 6 decimals (trader margin)
+        uint256 commission;     // 6 decimals (paid to LP at open)
+        uint256 lpLock;         // 6 decimals (LP reserved "dead capital" for this trade = max liability / capped profit)
+        TradeState state;
+    }
+
+    mapping(uint256 => Trade) public trades;
+
+    // -----------------------------
+    // LP Epoch system (lazy evaluation)
+    // -----------------------------
+    uint256 public constant EPOCH_DURATION = 1 minutes;
+
+    uint256 public currentEpoch;       // starts at 0
+    uint256 public epochStartTimestamp;
+
+    // End-of-epoch price snapshot: price of 1 share in 18 decimals (WAD)
+    // Example: 1.10 USDC => 1.10e18
+    mapping(uint256 => uint256) public lpTokenPrice; // epoch -> priceWad
+
+    // For audit/debug (optional but helpful)
+    mapping(uint256 => int256) public epochEquitySnapshot18; // epoch -> equity18 at pricing time
+
+    // Total shares supply (18 decimals)
+    uint256 public totalShares;
+
+    // Pending deposit queue (in 6 decimals) for each epoch
+    mapping(uint256 => uint256) public totalPendingDeposits; // epoch -> total pending (6 decimals)
+    mapping(address => mapping(uint256 => uint256)) public pendingDepositOf; // lp -> epoch -> amount (6 decimals)
+
+    // Per LP: list of epochs where they have (or had) a pending deposit
+    mapping(address => uint256[]) public epochsWithDeposits;
+    mapping(address => mapping(uint256 => bool)) public epochListed;
+
+    // -----------------------------
+    // Events
+    // -----------------------------
+    event OwnerChanged(address indexed oldOwner, address indexed newOwner);
+
+    event TraderDeposit(address indexed trader, uint256 amount6);
+    event TraderWithdraw(address indexed trader, uint256 amount6);
+
+    event OrderCreated(uint256 indexed tradeId, address indexed trader, uint256 margin6, uint256 commission6, uint256 lpLock6);
+    event OrderExecuted(uint256 indexed tradeId);
+    event OrderCancelled(uint256 indexed tradeId);
+    event PositionCreated(uint256 indexed tradeId, address indexed trader, uint256 margin6, uint256 commission6, uint256 lpLock6);
+    event TradeClosed(uint256 indexed tradeId, int256 pnl18, int256 actualPnl18);
+    event TradeLiquidated(uint256 indexed tradeId, uint256 marginSeized6);
+
+    event LpDepositRequested(address indexed lp, uint256 indexed epoch, uint256 newPending6, uint256 delta6);
+    event LpDepositReduced(address indexed lp, uint256 indexed epoch, uint256 newPending6, uint256 delta6);
+
+    event EpochRolled(
+        uint256 indexed epochClosed,
+        uint256 indexed epochOpened,
+        uint256 priceWad,
+        int256 equitySnapshot18,
+        uint256 depositsAdded6,
+        uint256 sharesMinted18
+    );
+
+    // -----------------------------
+    // Constructor
+    // -----------------------------
+    constructor() {
+        owner = msg.sender;
+        currentEpoch = 0;
+        epochStartTimestamp = block.timestamp;
+        // totalShares starts at 0; first epoch price defaults to 1.0 (handled in rollEpoch)
+    }
+
+    function setOwner(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "owner=0");
+        emit OwnerChanged(owner, newOwner);
+        owner = newOwner;
+    }
+
+    // -----------------------------
+    // Helpers: unit conversions
+    // -----------------------------
+    function _toWadFrom6(uint256 amount6) internal pure returns (uint256) {
+        return amount6 * USDC_TO_WAD;
+    }
+
+    function _to6FromWad(uint256 amount18) internal pure returns (uint256) {
+        return amount18 / USDC_TO_WAD;
+    }
+
+    // -----------------------------
+    // Trader funds (virtual)
+    // -----------------------------
+    function traderDeposit(uint256 amount6) external {
+        require(amount6 > 0, "amount=0");
+        freeBalance[msg.sender] += amount6;
+        emit TraderDeposit(msg.sender, amount6);
+    }
+
+    function traderWithdraw(uint256 amount6) external {
+        require(amount6 > 0, "amount=0");
+        require(freeBalance[msg.sender] >= amount6, "insufficient free");
+        freeBalance[msg.sender] -= amount6;
+        emit TraderWithdraw(msg.sender, amount6);
+    }
+
+    function _lockTrader(address trader, uint256 amount6) internal {
+        require(freeBalance[trader] >= amount6, "insufficient free to lock");
+        freeBalance[trader] -= amount6;
+        lockedBalance[trader] += amount6;
+    }
+
+    function _unlockTrader(address trader, uint256 amount6) internal {
+        require(lockedBalance[trader] >= amount6, "insufficient locked");
+        lockedBalance[trader] -= amount6;
+        freeBalance[trader] += amount6;
+    }
+
+    // -----------------------------
+    // LP capital locking for trades
+    // -----------------------------
+    function _lpLock(uint256 amount6) internal {
+        require(lpFreeCapital >= amount6, "not enough lpFree");
+        lpFreeCapital -= amount6;
+        lpLockedCapital += amount6;
+    }
+
+    function _lpUnlock(uint256 amount6) internal {
+        require(lpLockedCapital >= amount6, "lpLocked underflow");
+        lpLockedCapital -= amount6;
+        lpFreeCapital += amount6;
+    }
+
+    function _collectCommission(address trader, uint256 commission6) internal {
+        require(lockedBalance[trader] >= commission6, "locked < commission");
+        lockedBalance[trader] -= commission6;
+        lpFreeCapital += commission6;
+    }
+
+    // pnl is passed in 18 decimals (WAD) as signed value in "USDC units"
+    // Example: +12.34 USDC => +12.34e18 ; -5 USDC => -5e18
+    function _unlockAndSettle(address trader, uint256 marginLocked6, int256 pnl18) internal {
+        require(lockedBalance[trader] >= marginLocked6, "locked < margin");
+        lockedBalance[trader] -= marginLocked6;
+
+        if (pnl18 >= 0) {
+            uint256 profit6 = _to6FromWad(uint256(pnl18));
+            // LP must pay profit from free capital (after LP lock release is done by caller)
+            require(lpFreeCapital >= profit6, "lp insolvent (profit)");
+            freeBalance[trader] += (marginLocked6 + profit6);
+            lpFreeCapital -= profit6;
+        } else {
+            uint256 loss6 = _to6FromWad(uint256(-pnl18));
+            if (loss6 > marginLocked6) loss6 = marginLocked6;
+            freeBalance[trader] += (marginLocked6 - loss6);
+            lpFreeCapital += loss6;
+        }
+    }
+
+    // -----------------------------
+    // Trades: create order / execute / cancel / create position
+    // -----------------------------
+    function createOrder(
+        uint256 tradeId,
+        uint256 margin6,
+        uint256 commission6,
+        uint256 lpLock6
+    ) external {
+        address trader = msg.sender;
+
+        require(trades[tradeId].id == 0, "tradeId exists");
+        require(margin6 > 0, "margin=0");
+        require(lpLock6 > 0, "lpLock=0");
+
+        _lockTrader(trader, margin6 + commission6);
+
+        trades[tradeId] = Trade({
+            id: tradeId,
+            owner: trader,
+            margin: margin6,
+            commission: commission6,
+            lpLock: lpLock6,
+            state: TradeState.Pending
+        });
+
+        emit OrderCreated(tradeId, trader, margin6, commission6, lpLock6);
+    }
+
+    function executeOrder(uint256 tradeId) external {
+        Trade storage t = trades[tradeId];
+        require(t.id != 0, "trade missing");
+        require(t.state == TradeState.Pending, "not pending");
+
+        // 1) Ensure LP can cover the max liability
+        _lpLock(t.lpLock);
+
+        // 2) Take commission
+        _collectCommission(t.owner, t.commission);
+
+        t.state = TradeState.Open;
+        emit OrderExecuted(tradeId);
+    }
+
+    function cancelOrder(uint256 tradeId) external {
+        Trade storage t = trades[tradeId];
+        require(t.id != 0, "trade missing");
+        require(t.owner == msg.sender, "not owner");
+        require(t.state == TradeState.Pending, "not pending");
+
+        t.state = TradeState.Cancelled;
+
+        // Refund margin + commission
+        _unlockTrader(t.owner, t.margin + t.commission);
+
+        emit OrderCancelled(tradeId);
+    }
+
+    function createPosition(
+        uint256 tradeId,
+        uint256 margin6,
+        uint256 commission6,
+        uint256 lpLock6
+    ) external {
+        address trader = msg.sender;
+
+        require(trades[tradeId].id == 0, "tradeId exists");
+        require(margin6 > 0, "margin=0");
+        require(lpLock6 > 0, "lpLock=0");
+
+        // Lock trader funds
+        _lockTrader(trader, margin6 + commission6);
+
+        // Lock LP capital (must be available)
+        _lpLock(lpLock6);
+
+        // Take commission
+        _collectCommission(trader, commission6);
+
+        trades[tradeId] = Trade({
+            id: tradeId,
+            owner: trader,
+            margin: margin6,
+            commission: commission6,
+            lpLock: lpLock6,
+            state: TradeState.Open
+        });
+
+        emit PositionCreated(tradeId, trader, margin6, commission6, lpLock6);
+    }
+
+    // Close with pnl passed in 18 decimals (WAD)
+    function closeTrade(uint256 tradeId, int256 pnl18) external {
+        Trade storage t = trades[tradeId];
+        require(t.id != 0, "trade missing");
+        require(t.state == TradeState.Open, "not open");
+
+        // Cap pnl: profit <= lpLock ; loss <= margin
+        int256 actualPnl18 = pnl18;
+
+        if (pnl18 > 0) {
+            // Max profit in 18 decimals from lpLock6
+            uint256 maxProfit18 = _toWadFrom6(t.lpLock);
+            if (uint256(pnl18) > maxProfit18) {
+                actualPnl18 = int256(maxProfit18);
+            }
+        } else if (pnl18 < 0) {
+            uint256 maxLoss18 = _toWadFrom6(t.margin);
+            if (uint256(-pnl18) > maxLoss18) {
+                actualPnl18 = -int256(maxLoss18);
+            }
+        }
+
+        // 1) Release LP lock
+        _lpUnlock(t.lpLock);
+
+        // 2) Settle trader vs LP
+        _unlockAndSettle(t.owner, t.margin, actualPnl18);
+
+        t.state = TradeState.Closed;
+        emit TradeClosed(tradeId, pnl18, actualPnl18);
+    }
+
+    function liquidate(uint256 tradeId) external {
+        Trade storage t = trades[tradeId];
+        require(t.id != 0, "trade missing");
+        require(t.state == TradeState.Open, "not open");
+
+        // Release LP lock (position ends)
+        _lpUnlock(t.lpLock);
+
+        // Trader loses full margin
+        _unlockAndSettle(t.owner, t.margin, -int256(_toWadFrom6(t.margin)));
+
+        t.state = TradeState.Closed;
+        emit TradeLiquidated(tradeId, t.margin);
+    }
+
+    // -----------------------------
+    // LP: deposit requests (epoch queue)
+    // -----------------------------
+    function requestLpDeposit(uint256 amount6) external {
+        require(amount6 > 0, "amount=0");
+        uint256 e = currentEpoch;
+
+        // Add epoch to LP list once (lazy post-it)
+        if (!epochListed[msg.sender][e]) {
+            epochListed[msg.sender][e] = true;
+            epochsWithDeposits[msg.sender].push(e);
+        }
+
+        pendingDepositOf[msg.sender][e] += amount6;
+        totalPendingDeposits[e] += amount6;
+
+        emit LpDepositRequested(msg.sender, e, pendingDepositOf[msg.sender][e], amount6);
+    }
+
+    // Reduce/cancel only while epoch is current (by construction it always targets currentEpoch)
+    function reduceLpDeposit(uint256 amount6) external {
+        require(amount6 > 0, "amount=0");
+        uint256 e = currentEpoch;
+
+        uint256 cur = pendingDepositOf[msg.sender][e];
+        require(cur >= amount6, "reduce > pending");
+
+        pendingDepositOf[msg.sender][e] = cur - amount6;
+        totalPendingDeposits[e] -= amount6;
+
+        emit LpDepositReduced(msg.sender, e, pendingDepositOf[msg.sender][e], amount6);
+    }
+
+    // -----------------------------
+    // Epoch rollover (Option A)
+    // -----------------------------
+    /*
+        rollEpoch(unrealizedPnlTraders18)
+
+        - Must be called when 24h passed since epochStartTimestamp.
+        - Computes end-of-epoch price and stores lpTokenPrice[currentEpoch].
+        - Mints shares globally for deposits placed during the epoch.
+        - Moves those deposits into lpFreeCapital (they start backing trades in the NEW epoch).
+        - Increments epoch.
+
+        unrealizedPnlTraders18 is signed, WAD:
+            + => traders are winning => LP equity lower
+            - => traders are losing => LP equity higher
+    */
+    // Ajoute un flag (ou utilise total roll count)
+    bool public firstRollDone;
+    
+    function rollEpoch(int256 unrealizedPnlTraders18) external {
+        // Premier roll: owner only
+        if (!firstRollDone) {
+            require(msg.sender == owner, "First roll: owner only");
+        }
+
+        require(block.timestamp >= epochStartTimestamp + EPOCH_DURATION, "epoch not ended");
+
+        uint256 e = currentEpoch;
+
+        int256 lpEquity18 = int256(_toWadFrom6(lpFreeCapital + lpLockedCapital));
+        int256 equity18 = lpEquity18 - unrealizedPnlTraders18;
+
+        uint256 priceWad;
+
+        // ---- KEY CHANGE: if no shares exist, reset price to 1.0 ----
+        if (totalShares == 0) {
+            // Incohérent d'avoir un PnL non réalisé si aucun LP share n'existe
+            // (sauf si tu assumes un backstop externe).
+            require(unrealizedPnlTraders18 == 0, "unrealizedPnL must be 0 when totalShares=0");
+
+            // Prix de référence = 1$
+            priceWad = WAD;
+
+            // On autorise equity18 à être 0 (vault vide) ou >0 (si tu as laissé du capital dans lpFreeCapital)
+            // Mais si equity18 < 0, ça veut dire dette/insolvabilité.
+            require(equity18 >= 0, "equity<0");
+        } else {
+            require(equity18 > 0, "equity<=0");
+            priceWad = uint256(equity18) * WAD / totalShares;
+            require(priceWad > 0, "price=0");
+        }
+
+        // Snapshot fin d’epoch
+        lpTokenPrice[e] = priceWad;
+        epochEquitySnapshot18[e] = equity18;
+
+        // Mint global des shares pour les dépôts de l’epoch e
+        uint256 deposits6 = totalPendingDeposits[e];
+        uint256 sharesMinted18 = 0;
+
+        if (deposits6 > 0) {
+            uint256 deposits18 = _toWadFrom6(deposits6);
+            sharesMinted18 = deposits18 * WAD / priceWad;
+
+            totalShares += sharesMinted18;
+
+            // Option A: les dépôts deviennent du capital utilisable à la nouvelle epoch
+            lpFreeCapital += deposits6;
+        }
+
+        // Epoch suivante
+        currentEpoch = e + 1;
+        epochStartTimestamp = block.timestamp;
+
+        if (!firstRollDone) firstRollDone = true;
+
+        emit EpochRolled(e, currentEpoch, priceWad, equity18, deposits6, sharesMinted18);
+    }
+
+
+    // -----------------------------
+    // Views: LP shares (lazy evaluation)
+    // -----------------------------
+    function getLpEpochsCount(address lp) external view returns (uint256) {
+        return epochsWithDeposits[lp].length;
+    }
+
+    function getLpEpochAt(address lp, uint256 index) external view returns (uint256) {
+        return epochsWithDeposits[lp][index];
+    }
+
+    /*
+        Computes LP shares (18 decimals) by iterating over the LP's epochs list.
+
+        Note:
+        - Only epochs that are CLOSED have a price (lpTokenPrice[e] > 0)
+        - For the current epoch, price is not available (end-of-epoch), so we do not convert it here.
+    */
+    function computeLpShares(address lp) external view returns (
+        uint256 shares18,
+        uint256 pendingCurrentEpoch6
+    ) {
+        uint256[] memory list = epochsWithDeposits[lp];
+        uint256 len = list.length;
+
+        uint256 s = 0;
+        for (uint256 i = 0; i < len; i++) {
+            uint256 e = list[i];
+
+            uint256 dep6 = pendingDepositOf[lp][e];
+            if (dep6 == 0) continue;
+
+            // Only convert if epoch is closed and price exists
+            uint256 price = lpTokenPrice[e];
+            if (price == 0) {
+                // not closed yet (likely current epoch)
+                continue;
+            }
+
+            uint256 dep18 = _toWadFrom6(dep6);
+            s += dep18 * WAD / price;
+        }
+
+        shares18 = s;
+        pendingCurrentEpoch6 = pendingDepositOf[lp][currentEpoch];
+    }
+
+    // -----------------------------
+    // Views: trader totals
+    // -----------------------------
+    function getTraderTotalBalance(address trader) external view returns (uint256 total6) {
+        return freeBalance[trader] + lockedBalance[trader];
+    }
+
+    function getLpTotalCapital6() external view returns (uint256 total6) {
+        return lpFreeCapital + lpLockedCapital;
+    }
+
+    function getLpTotalCapital18() external view returns (uint256 total18) {
+        return _toWadFrom6(lpFreeCapital + lpLockedCapital);
+    }
+}
