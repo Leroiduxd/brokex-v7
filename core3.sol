@@ -28,29 +28,29 @@ interface ISupraOraclePull {
 /* ===================== */
 
 interface IBrokexVault {
-    function openOrder(
+    function createOrder(
         uint256 tradeId,
         address trader,
-        uint256 marginUSDC,
-        uint256 commissionUSDC,
-        uint256 lpLockUSDC
+        uint256 margin6,
+        uint256 commission6,
+        uint256 lpLock6
     ) external;
 
     function executeOrder(uint256 tradeId) external;
 
-    function openMarket(
-        uint256 tradeId,
-        address trader,
-        uint256 marginUSDC,
-        uint256 commissionUSDC,
-        uint256 lpLockUSDC
-    ) external;
-
     function cancelOrder(uint256 tradeId) external;
 
-    function closeTrade(uint256 tradeId, int256 pnlX6) external;
+    function createPosition(
+        uint256 tradeId,
+        address trader,
+        uint256 margin6,
+        uint256 commission6,
+        uint256 lpLock6
+    ) external;
 
-    function liquidateTrade(uint256 tradeId) external;
+    function closeTrade(uint256 tradeId, int256 pnl18) external;
+
+    function liquidate(uint256 tradeId) external;
 }
 
 
@@ -584,69 +584,6 @@ contract BrokexCore {
         brokexVault = IBrokexVault(vault);
     }
 
-    /* ===================== */
-    /* VAULT INTERFACE      */
-    /* ===================== */
-
-    function openOrder(
-        uint256 tradeId,
-        address trader,
-        uint256 marginUSDC,
-        uint256 commissionUSDC,
-        uint256 lpLockUSDC
-    ) external onlyVault {
-        Trade storage t = trades[tradeId];
-        t.marginUsdc = uint64(marginUSDC);
-        t.lpLockedCapital = uint64(lpLockUSDC);
-    }
-
-    function executeOrder(uint256 tradeId) external onlyVault {
-        Trade storage t = trades[tradeId];
-
-        _updateExposure(t.assetId, t.lotSize, t.openPrice, t.isLong, true);
-        _updateExposureLimits(t.assetId, t.lpLockedCapital, t.marginUsdc, t.isLong, true);
-
-        _updateTradeState(tradeId, 1);
-    }
-
-    function openMarket(
-        uint256 tradeId,
-        address trader,
-        uint256 marginUSDC,
-        uint256 commissionUSDC,
-        uint256 lpLockUSDC
-    ) external onlyVault {
-        Trade storage t = trades[tradeId];
-        t.marginUsdc = uint64(marginUSDC);
-        t.lpLockedCapital = uint64(lpLockUSDC);
-
-        _updateExposure(t.assetId, t.lotSize, t.openPrice, t.isLong, true);
-        _updateExposureLimits(t.assetId, t.lpLockedCapital, t.marginUsdc, t.isLong, true);
-
-        _updateTradeState(tradeId, 1);
-    }
-
-    function cancelOrder(uint256 tradeId) external onlyVault {
-        _updateTradeState(tradeId, 3);
-    }
-
-    function closeTrade(uint256 tradeId, int256 pnlX6) external onlyVault {
-        Trade storage t = trades[tradeId];
-
-        _updateExposure(t.assetId, t.lotSize, t.openPrice, t.isLong, false);
-        _updateExposureLimits(t.assetId, t.lpLockedCapital, t.marginUsdc, t.isLong, false);
-
-        _updateTradeState(tradeId, 2);
-    }
-
-    function liquidateTrade(uint256 tradeId) external onlyVault {
-        Trade storage t = trades[tradeId];
-
-        _updateExposure(t.assetId, t.lotSize, t.openPrice, t.isLong, false);
-        _updateExposureLimits(t.assetId, t.lpLockedCapital, t.marginUsdc, t.isLong, false);
-
-        _updateTradeState(tradeId, 2);
-    }
 
     /* ===================== */
     /* UNREALIZED PNL       */
